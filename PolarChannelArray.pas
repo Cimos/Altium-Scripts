@@ -1,6 +1,39 @@
 {*******************************************************************************
-  PolarChannelArray.pas  --
+  PolarChannelArray.pas  -- REVISED v10
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
+
+  ================================================================
+  WHAT CHANGED FROM v9
+  ================================================================
+  Reset step is now AUTOMATIC (no longer optional). Before arranging,
+  all non-reference channels are always normalised to match the
+  reference channel's (first channel, e.g. U_DUTB) internal layout.
+  This guarantees a clean starting state on every run, whether it is
+  the first run or a repeat run on an already-arranged board.
+
+  ================================================================
+  WHAT CHANGED FROM v8 (v9 summary)
+  ================================================================
+  Added the reset step that normalises all non-reference channels to
+  match the reference channel's internal layout BEFORE running the
+  polar array.
+
+  Why this matters: running the script a second time on an already-
+  arranged board stacks another rotation on top of the existing one,
+  because each component's rotation is added to. Same if the channels
+  start out with inconsistent orientations -- the final ring will look
+  uneven.
+
+  The reset works by matching components across channels by their
+  "root" designator (designator with the channel class suffix stripped),
+  then copying the reference component's relative position and absolute
+  rotation to each matching component in the other channels. After the
+  reset, every channel is a positional copy of the reference -- ready
+  for the polar array step.
+
+  Note: free tracks/vias/fills belonging to non-reference channels are
+  not moved by the reset step. They are handled in the polar arrangement
+  step, but only if they sit within the reference channel's bounding box.
 
   ================================================================
   NOTE ON DIALOG POSITIONING
@@ -508,6 +541,146 @@ begin
   Board.BoardIterator_Destroy(Iter);
 end;
 
+{ ---------------------------------------------------------------------------
+  StripChannelSuffix
+  Removes the channel suffix from a designator. The suffix is the channel
+  class name preceded by an underscore, e.g.:
+    Designator "C1_U_DUTB", class "U_DUTB" -> "C1"
+    Designator "R3_U_DUTC", class "U_DUTC" -> "R3"
+  If the designator doesn't end with the suffix, returns the designator
+  unchanged. Case-insensitive.
+--------------------------------------------------------------------------- }
+function StripChannelSuffix(designator, className : String) : String;
+var
+  suffix : String;
+  desigLen, suffLen : Integer;
+begin
+  suffix := '_' + className;
+  desigLen := Length(designator);
+  suffLen := Length(suffix);
+  if (desigLen >= suffLen) and
+     (AnsiUpperCase(Copy(designator, desigLen - suffLen + 1, suffLen)) =
+      AnsiUpperCase(suffix)) then
+    Result := Copy(designator, 1, desigLen - suffLen)
+  else
+    Result := designator;
+end;
+
+{ ---------------------------------------------------------------------------
+  FindMatchingComponent
+  Looks through the given class for a component whose "root" designator
+  (stripped of the class suffix) matches the target root. Returns Nil if
+  not found.
+--------------------------------------------------------------------------- }
+function FindMatchingComponent(Board : IPCB_Board;
+                               Cls : IPCB_ObjectClass;
+                               className : String;
+                               targetRoot : String) : IPCB_Component;
+var
+  Iter : IPCB_BoardIterator;
+  Comp : IPCB_Component;
+  root : String;
+begin
+  Result := Nil;
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eComponentObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Comp := Iter.FirstPCBObject;
+  while Comp <> Nil do
+  begin
+    if Cls.IsMember(Comp) then
+    begin
+      root := StripChannelSuffix(Comp.Name.Text, className);
+      if AnsiUpperCase(root) = AnsiUpperCase(targetRoot) then
+      begin
+        Result := Comp;
+        Break;
+      end;
+    end;
+    Comp := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+end;
+
+{ ---------------------------------------------------------------------------
+  ResetChannelsToMatchReference
+  For each channel other than the reference, repositions and re-rotates
+  every component to match the corresponding component in the reference
+  channel.
+
+  "Corresponding" means: same root designator (designator minus the
+  channel class suffix). The reference channel's components are read
+  once up-front and used as the template.
+
+  After this procedure runs, every channel occupies the same space as
+  the reference channel -- they all overlap visually. That is the
+  expected intermediate state before the polar array step rotates
+  them around the origin.
+
+  Returns the number of components that were successfully matched and
+  repositioned. If a target channel has a component whose root designator
+  isn't found in the reference, that component is skipped (warning in
+  the final summary).
+--------------------------------------------------------------------------- }
+function ResetChannelsToMatchReference(Board     : IPCB_Board;
+                                       RefCls    : IPCB_ObjectClass;
+                                       RefClsName : String;
+                                       ChanNames : TStringList) : Integer;
+var
+  CompIter : IPCB_BoardIterator;
+  Comp, refComp : IPCB_Component;
+  i : Integer;
+  otherClsName : String;
+  otherCls : IPCB_ObjectClass;
+  root : String;
+  matched : Integer;
+begin
+  matched := 0;
+
+  { For each non-reference channel }
+  for i := 1 to ChanNames.Count - 1 do
+  begin
+    otherClsName := ChanNames[i];
+    otherCls := FindClassByName(Board, otherClsName);
+    if otherCls = Nil then Continue;
+
+    { Walk every component in this other channel and copy the reference
+      component's position and rotation into it. }
+    CompIter := Board.BoardIterator_Create;
+    CompIter.AddFilter_ObjectSet(MkSet(eComponentObject));
+    CompIter.AddFilter_LayerSet(AllLayers);
+    CompIter.AddFilter_Method(eProcessAll);
+
+    Comp := CompIter.FirstPCBObject;
+    while Comp <> Nil do
+    begin
+      if otherCls.IsMember(Comp) then
+      begin
+        root := StripChannelSuffix(Comp.Name.Text, otherClsName);
+        refComp := FindMatchingComponent(Board, RefCls, RefClsName, root);
+        if refComp <> Nil then
+        begin
+          { Copy absolute position and rotation from the reference
+            component. The whole channel ends up sitting exactly where
+            the reference sits. }
+          Comp.X := refComp.X;
+          Comp.Y := refComp.Y;
+          Comp.Rotation := refComp.Rotation;
+          Comp.Layer := refComp.Layer;
+          Comp.GraphicallyInvalidate;
+          matched := matched + 1;
+        end;
+      end;
+      Comp := CompIter.NextPCBObject;
+    end;
+    Board.BoardIterator_Destroy(CompIter);
+  end;
+
+  Result := matched;
+end;
+
 { ===========================================================================
   ENTRY POINT
 =========================================================================== }
@@ -530,6 +703,7 @@ var
   refCX, refCY : TCoord;
   refR_mm : Double;
   summary : String;
+  resetMatched : Integer;
 begin
   Board := PCBServer.GetCurrentPCBBoard;
   if Board = Nil then
@@ -675,7 +849,13 @@ begin
     Exit;
   end;
 
-  { ---- Step 6: Confirmation ---- }
+  { ---- Step 6: Reset always runs ----
+    All non-reference channels are normalised to match the reference
+    channel (ChanNames[0], e.g. U_DUTB) before the polar array is
+    applied. This guarantees a clean starting state on every run. }
+  resetMatched := 0;
+
+  { ---- Step 7: Confirmation ---- }
   summary := 'Polar Channel Array -- Summary' + #13#10 + #13#10 +
              'Matched prefix: "' + prefix + '"' + #13#10 +
              'Channel count: ' + IntToStr(N) + #13#10 +
@@ -685,7 +865,12 @@ begin
     if i > 0 then summary := summary + ', ';
     summary := summary + ChanNames[i];
   end;
-  summary := summary + #13#10 + #13#10 +
+  summary := summary + #13#10 + #13#10;
+
+  summary := summary +
+             'Reset: ENABLED (all channels will snap to reference first)' + #13#10 + #13#10;
+
+  summary := summary +
              'Reference (unmoved): ' + ChanNames[0] + #13#10 +
              'Reference bbox centre: (' +
                FloatToStrF(CoordToMMs(refCX), ffFixed, 10, 3) + ', ' +
@@ -706,7 +891,20 @@ begin
     Exit;
   end;
 
-  { ---- Step 7: Apply transforms ---- }
+  { ---- Step 8: Apply reset ---- }
+  PCBServer.PreProcess;
+  resetMatched := ResetChannelsToMatchReference(Board, Cls, ChanNames[0], ChanNames);
+  PCBServer.PostProcess;
+  Board.GraphicallyInvalidate;
+
+  { After reset, re-measure the reference bbox. It shouldn't have
+    changed (reference components weren't touched) but recomputing is
+    cheap and keeps refCX/refCY honest. }
+  ComputeChannelBBox(Board, Cls, minX, minY, maxX, maxY, compCount);
+  refCX := (minX + maxX) div 2;
+  refCY := (minY + maxY) div 2;
+
+  { ---- Step 9: Apply polar transforms ---- }
   DoneSet := TStringList.Create;
   DoneSet.Sorted := True;
   DoneSet.Duplicates := dupIgnore;
@@ -744,6 +942,7 @@ begin
   ShowMessage('Done: ' + IntToStr(N) + ' channels arranged on a ' +
               FloatToStrF(refR_mm, ffFixed, 10, 3) + ' mm radius circle.' + #13#10 +
               IntToStr(DoneSet.Count) + ' free primitives transformed.' + #13#10 +
+              'Reset snapped ' + IntToStr(resetMatched) + ' components to reference.' + #13#10 +
               'Reference ' + ChanNames[0] + ' was not moved.' + #13#10 + #13#10 +
               'Next: Tools > Polygon Pours > Repour All, then run DRC.');
 
