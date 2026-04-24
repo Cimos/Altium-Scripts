@@ -1,15 +1,31 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v10
+  PolarChannelArray.pas  -- REVISED v11
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
 
   ================================================================
-  WHAT CHANGED FROM v9
+  WHAT CHANGED FROM v10
+  ================================================================
+  Reference channel is now selected by CLICKING any component in the
+  reference channel on the PCB, instead of typing a class-name prefix.
+  The script resolves the click to the nearest component, reads its
+  channel-specific component class membership to get the reference
+  class name, and auto-derives the channel-set prefix by finding the
+  longest name-prefix the clicked class shares with at least one other
+  class on the board.
+
+  (Rooms aren't used for selection because Altium's DelphiScript enum
+   does not expose a standard room-object filter constant across all
+   versions; components are iterated via the stable eComponentObject
+   enum and carry the component-class membership we need.)
+
+  ================================================================
+  WHAT CHANGED FROM v9 (v10 summary)
   ================================================================
   Reset step is now AUTOMATIC (no longer optional). Before arranging,
   all non-reference channels are always normalised to match the
-  reference channel's (first channel, e.g. U_DUTB) internal layout.
-  This guarantees a clean starting state on every run, whether it is
-  the first run or a repeat run on an already-arranged board.
+  reference channel's (e.g. U_DUTB) internal layout. This guarantees a
+  clean starting state on every run, whether it is the first run or a
+  repeat run on an already-arranged board.
 
   ================================================================
   WHAT CHANGED FROM v8 (v9 summary)
@@ -162,82 +178,6 @@ begin
     Comp := Iter.NextPCBObject;
   end;
   Board.BoardIterator_Destroy(Iter);
-end;
-
-{ ---------------------------------------------------------------------------
-  BuildClassInventory
-  Walks the board's component classes and builds an informational list
-  of 'name (count components)' strings. Used to show the user what's
-  available before prompting for a prefix.
---------------------------------------------------------------------------- }
-procedure BuildClassInventory(Board : IPCB_Board;
-                              List  : TStringList);
-var
-  Iter : IPCB_BoardIterator;
-  Prim : IPCB_Primitive;
-  Cls  : IPCB_ObjectClass;
-  n    : Integer;
-begin
-  Iter := Board.BoardIterator_Create;
-  Iter.AddFilter_ObjectSet(MkSet(eClassObject));
-  Iter.AddFilter_LayerSet(AllLayers);
-  Iter.AddFilter_Method(eProcessAll);
-
-  Prim := Iter.FirstPCBObject;
-  while Prim <> Nil do
-  begin
-    Cls := Prim;
-    if Cls.MemberKind = COMP_CLASS_MEMBER_KIND then
-    begin
-      n := CountClassMembers(Board, Cls);
-      { Skip classes with zero members -- noisy }
-      if n > 0 then
-        List.Add(Cls.Name + '  (' + IntToStr(n) + ' comps)');
-    end;
-    Prim := Iter.NextPCBObject;
-  end;
-  Board.BoardIterator_Destroy(Iter);
-end;
-
-{ ---------------------------------------------------------------------------
-  GuessCommonPrefix
-  Given a list of class names that already match a user prefix, find
-  the longest common prefix among them. Used to seed a default prefix
-  suggestion for the user.
---------------------------------------------------------------------------- }
-function GuessCommonPrefix(Names : TStringList) : String;
-var
-  i, k, minLen : Integer;
-  first, candidate : String;
-  allMatch : Boolean;
-begin
-  Result := '';
-  if Names.Count = 0 then Exit;
-  if Names.Count = 1 then
-  begin
-    Result := Names[0];
-    Exit;
-  end;
-
-  first := Names[0];
-  minLen := Length(first);
-  for i := 1 to Names.Count - 1 do
-    if Length(Names[i]) < minLen then minLen := Length(Names[i]);
-
-  k := 0;
-  while k < minLen do
-  begin
-    candidate := Copy(first, 1, k + 1);
-    allMatch := True;
-    for i := 1 to Names.Count - 1 do
-      if Copy(Names[i], 1, k + 1) <> candidate then
-      begin
-        allMatch := False;
-        Break;
-      end;
-    if allMatch then k := k + 1 else Break;
-  end;
-  Result := Copy(first, 1, k);
 end;
 
 { --------------------------------------------------------------------------- }
@@ -681,6 +621,155 @@ begin
   Result := matched;
 end;
 
+{ ---------------------------------------------------------------------------
+  FindComponentAtLocation
+  Returns the component whose bounding box contains (X, Y). If none
+  contains the click, returns the nearest component within a reasonable
+  search radius. Returns Nil if nothing is near.
+--------------------------------------------------------------------------- }
+function FindComponentAtLocation(Board : IPCB_Board;
+                                 X     : TCoord;
+                                 Y     : TCoord) : IPCB_Component;
+var
+  Iter     : IPCB_BoardIterator;
+  Comp     : IPCB_Component;
+  bestComp : IPCB_Component;
+  bestDist : Double;
+  dist     : Double;
+begin
+  bestComp := Nil;
+  bestDist := 1e30;
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eComponentObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Comp := Iter.FirstPCBObject;
+  while Comp <> Nil do
+  begin
+    if (X >= Comp.BoundingRectangle.Left)   and
+       (X <= Comp.BoundingRectangle.Right)  and
+       (Y >= Comp.BoundingRectangle.Bottom) and
+       (Y <= Comp.BoundingRectangle.Top) then
+    begin
+      { Direct hit -- prefer over any distance-based match. }
+      bestComp := Comp;
+      bestDist := -1;
+      Break;
+    end;
+    dist := Sqrt(Sqr(CoordToMMs(Comp.X - X)) + Sqr(CoordToMMs(Comp.Y - Y)));
+    if dist < bestDist then
+    begin
+      bestComp := Comp;
+      bestDist := dist;
+    end;
+    Comp := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+  Result := bestComp;
+end;
+
+{ ---------------------------------------------------------------------------
+  FindChannelClassForComponent
+  Walks all component classes and returns the name of the most-specific
+  one the given component belongs to. In multi-channel designs the
+  channel class is usually the longest-named class a component is a
+  member of (e.g. "U_DUTB" rather than the generic "All Components").
+  Returns '' if the component has no channel class.
+--------------------------------------------------------------------------- }
+function FindChannelClassForComponent(Board : IPCB_Board;
+                                      Comp  : IPCB_Component) : String;
+var
+  Iter         : IPCB_BoardIterator;
+  Prim         : IPCB_Primitive;
+  Cls          : IPCB_ObjectClass;
+  longestMatch : String;
+begin
+  longestMatch := '';
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eClassObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Prim := Iter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    Cls := Prim;
+    if (Cls.MemberKind = COMP_CLASS_MEMBER_KIND) and Cls.IsMember(Comp) then
+    begin
+      if Length(Cls.Name) > Length(longestMatch) then
+        longestMatch := Cls.Name;
+    end;
+    Prim := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+  Result := longestMatch;
+end;
+
+{ ---------------------------------------------------------------------------
+  DerivePrefixFromReference
+  Given the reference class name (e.g. "U_DUTB"), finds the longest
+  prefix of that name that ALSO matches at least one OTHER component
+  class on the board. For a set [U_DUTB, U_DUTC, U_DUTD] this returns
+  "U_DUT". Returns '' if no sibling class shares any prefix of the
+  reference name.
+--------------------------------------------------------------------------- }
+function DerivePrefixFromReference(Board   : IPCB_Board;
+                                   refName : String)    : String;
+var
+  Iter       : IPCB_BoardIterator;
+  Prim       : IPCB_Primitive;
+  Cls        : IPCB_ObjectClass;
+  AllClasses : TStringList;
+  i, k       : Integer;
+  cand       : String;
+  found      : Boolean;
+begin
+  Result := '';
+  AllClasses := TStringList.Create;
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eClassObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Prim := Iter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    Cls := Prim;
+    if (Cls.MemberKind = COMP_CLASS_MEMBER_KIND) and
+       (AnsiUpperCase(Cls.Name) <> AnsiUpperCase(refName)) and
+       (CountClassMembers(Board, Cls) > 0) then
+      AllClasses.Add(Cls.Name);
+    Prim := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+
+  { Try longest prefix first; first hit wins. }
+  for k := Length(refName) - 1 downto 1 do
+  begin
+    cand := Copy(refName, 1, k);
+    found := False;
+    for i := 0 to AllClasses.Count - 1 do
+    begin
+      if AnsiUpperCase(Copy(AllClasses[i], 1, k)) = AnsiUpperCase(cand) then
+      begin
+        found := True;
+        Break;
+      end;
+    end;
+    if found then
+    begin
+      Result := cand;
+      Break;
+    end;
+  end;
+
+  AllClasses.Free;
+end;
+
 { ===========================================================================
   ENTRY POINT
 =========================================================================== }
@@ -689,14 +778,15 @@ var
   Board     : IPCB_Board;
   Cls       : IPCB_ObjectClass;
 
-  ClassInventory : TStringList;  { all channel-style classes on this board }
-  ChanNames      : TStringList;  { names that match the chosen prefix }
+  ChanNames      : TStringList;  { matching channel class names }
   DoneSet        : TStringList;
 
-  i, N, compCount : Integer;
-  invMessage, prefix, defPrefix, inputStr : String;
+  i, N, compCount, refIdx : Integer;
+  prefix, inputStr, refClassName : String;
   cx_mm, cy_mm : Double;
   CX, CY    : TCoord;
+  refX, refY : TCoord;
+  refComp   : IPCB_Component;
   rotateDeg : Double;
   newCX, newCY, oldCX, oldCY : TCoord;
   minX, minY, maxX, maxY, margin : TCoord;
@@ -712,58 +802,51 @@ begin
     Exit;
   end;
 
-  { ---- Step 1: Inventory all component classes on the board ---- }
-  ClassInventory := TStringList.Create;
-  ClassInventory.Sorted := True;
-  BuildClassInventory(Board, ClassInventory);
+  { ---- Step 1: Ask user to click a component in the reference channel ----
+    Board.ChooseLocation puts Altium into crosshair mode. The user clicks
+    on (or near) any component belonging to the channel that defines the
+    template layout (e.g. a resistor in U_DUTB). The script resolves the
+    click to the nearest component, then reads its channel-specific class
+    membership to get the reference class name. }
+  ShowMessage('Step 1 of 2: Click on any COMPONENT in the REFERENCE channel.' + #13#10 + #13#10 +
+              'The component you click tells the script which channel is' + #13#10 +
+              'the reference. Every other channel in the detected set will' + #13#10 +
+              'be normalised to match the reference before the polar array' + #13#10 +
+              'is applied.' + #13#10 + #13#10 +
+              'Tip: click directly on a component pad or body for best results.');
 
-  if ClassInventory.Count = 0 then
+  if not Board.ChooseLocation(refX, refY, 'Click a component in the reference channel') then
+    Exit;
+
+  refComp := FindComponentAtLocation(Board, refX, refY);
+  if refComp = Nil then
   begin
-    ShowMessage('No component classes found on this board.' + #13#10 +
-                'Multi-channel designs are expected to have component classes' + #13#10 +
-                'generated from the schematic hierarchy.');
-    ClassInventory.Free;
+    ShowMessage('ERROR: No component found near the clicked location.' + #13#10 +
+                'Click closer to a component in the reference channel.');
     Exit;
   end;
 
-  { ---- Step 2: Show inventory and ask for prefix ---- }
-  invMessage := 'Component classes on this board:' + #13#10 + #13#10;
-  for i := 0 to ClassInventory.Count - 1 do
-    invMessage := invMessage + '  ' + ClassInventory[i] + #13#10;
-  invMessage := invMessage + #13#10 +
-                'Enter a PREFIX that matches all channel classes you want' + #13#10 +
-                'to arrange (case-insensitive). Example: if you have classes' + #13#10 +
-                'U_DUTB, U_DUTC, U_DUTD, enter: U_DUT';
-
-  { Use a guessed prefix as the default to reduce typing on re-runs }
-  defPrefix := '';
-  if ClassInventory.Count >= 2 then
+  refClassName := FindChannelClassForComponent(Board, refComp);
+  if Trim(refClassName) = '' then
   begin
-    { Get the raw names without the '(N comps)' suffix }
-    ChanNames := TStringList.Create;
-    for i := 0 to ClassInventory.Count - 1 do
-    begin
-      inputStr := ClassInventory[i];
-      { Strip '  (N comps)' suffix }
-      if Pos('  (', inputStr) > 0 then
-        inputStr := Copy(inputStr, 1, Pos('  (', inputStr) - 1);
-      ChanNames.Add(inputStr);
-    end;
-    defPrefix := GuessCommonPrefix(ChanNames);
-    ChanNames.Free;
-  end;
-
-  prefix := InputBox('Polar Channel Array - Select Prefix',
-                     invMessage, defPrefix);
-  if Trim(prefix) = '' then
-  begin
-    ClassInventory.Free;
+    ShowMessage('ERROR: The clicked component (' + refComp.Name.Text + ')' + #13#10 +
+                'does not belong to any component class.' + #13#10 +
+                'Multi-channel designs should have auto-generated classes.');
     Exit;
   end;
 
-  ClassInventory.Free;
+  prefix := DerivePrefixFromReference(Board, refClassName);
+  if prefix = '' then
+  begin
+    ShowMessage('ERROR: Could not derive a channel prefix from "' +
+                refClassName + '".' + #13#10 +
+                'No other component class on this board shares any prefix' + #13#10 +
+                'with the clicked component''s class. A polar array needs' + #13#10 +
+                'at least 2 sibling channels.');
+    Exit;
+  end;
 
-  { ---- Step 3: Collect matching classes ---- }
+  { ---- Step 2: Collect matching classes, put reference first ---- }
   ChanNames := TStringList.Create;
   ChanNames.Sorted := True;
   ChanNames.Duplicates := dupIgnore;
@@ -774,19 +857,36 @@ begin
   if N < 2 then
   begin
     ShowMessage('Only ' + IntToStr(N) + ' channel(s) matched prefix "' +
-                prefix + '".' + #13#10 +
+                prefix + '" (derived from "' + refClassName + '").' + #13#10 +
                 'Need at least 2 to form a polar array.');
     ChanNames.Free;
     Exit;
   end;
 
-  { ---- Step 4: Ask for origin by interactive click ----
+  { Move the clicked reference class to index 0. Rest stay alphabetical. }
+  refIdx := ChanNames.IndexOf(refClassName);
+  if refIdx < 0 then
+  begin
+    ShowMessage('ERROR: Reference class "' + refClassName +
+                '" did not appear in the matched set.' + #13#10 +
+                'This should not happen -- check that the clicked component''s' + #13#10 +
+                'class name matches a sibling class on the board exactly.');
+    ChanNames.Free;
+    Exit;
+  end;
+  if refIdx > 0 then
+  begin
+    ChanNames.Sorted := False;
+    ChanNames.Move(refIdx, 0);
+  end;
+
+  { ---- Step 3: Ask for origin by interactive click ----
     Board.ChooseLocation puts Altium into crosshair mode with a status-bar
     prompt. The user clicks on the polar centre (snapping to their polar
     grid if one is enabled). If the user presses Escape, ChooseLocation
     returns False and we fall back to typed input defaulting to (0, 0). }
   if MessageDlg(
-       'Next: click the polar origin point on the PCB.' + #13#10 + #13#10 +
+       'Step 2 of 2: Click the polar origin point on the PCB.' + #13#10 + #13#10 +
        'If you have a Polar Grid defined, enable snap and click near' + #13#10 +
        'its centre -- Altium will snap to the exact origin.' + #13#10 + #13#10 +
        'Yes = click to pick origin on PCB' + #13#10 +
@@ -818,7 +918,7 @@ begin
     CY := MMsToCoord(cy_mm);
   end;
 
-  { ---- Step 5: Measure reference channel ---- }
+  { ---- Step 4: Measure reference channel ---- }
   Cls := FindClassByName(Board, ChanNames[0]);
   if Cls = Nil then
   begin
@@ -849,17 +949,19 @@ begin
     Exit;
   end;
 
-  { ---- Step 6: Reset always runs ----
+  { ---- Step 5: Reset always runs ----
     All non-reference channels are normalised to match the reference
-    channel (ChanNames[0], e.g. U_DUTB) before the polar array is
-    applied. This guarantees a clean starting state on every run. }
+    channel (ChanNames[0] = class of the clicked component) before the
+    polar array is applied. This guarantees a clean starting state on
+    every run. }
   resetMatched := 0;
 
-  { ---- Step 7: Confirmation ---- }
+  { ---- Step 6: Confirmation ---- }
   summary := 'Polar Channel Array -- Summary' + #13#10 + #13#10 +
-             'Matched prefix: "' + prefix + '"' + #13#10 +
+             'Reference (clicked): ' + refClassName + #13#10 +
+             'Derived prefix: "' + prefix + '"' + #13#10 +
              'Channel count: ' + IntToStr(N) + #13#10 +
-             'Channels (sorted): ';
+             'Channels (reference first): ';
   for i := 0 to N - 1 do
   begin
     if i > 0 then summary := summary + ', ';
@@ -871,7 +973,6 @@ begin
              'Reset: ENABLED (all channels will snap to reference first)' + #13#10 + #13#10;
 
   summary := summary +
-             'Reference (unmoved): ' + ChanNames[0] + #13#10 +
              'Reference bbox centre: (' +
                FloatToStrF(CoordToMMs(refCX), ffFixed, 10, 3) + ', ' +
                FloatToStrF(CoordToMMs(refCY), ffFixed, 10, 3) + ') mm' + #13#10 +
@@ -891,7 +992,7 @@ begin
     Exit;
   end;
 
-  { ---- Step 8: Apply reset ---- }
+  { ---- Step 7: Apply reset ---- }
   PCBServer.PreProcess;
   resetMatched := ResetChannelsToMatchReference(Board, Cls, ChanNames[0], ChanNames);
   PCBServer.PostProcess;
@@ -904,7 +1005,7 @@ begin
   refCX := (minX + maxX) div 2;
   refCY := (minY + maxY) div 2;
 
-  { ---- Step 9: Apply polar transforms ---- }
+  { ---- Step 8: Apply polar transforms ---- }
   DoneSet := TStringList.Create;
   DoneSet.Sorted := True;
   DoneSet.Duplicates := dupIgnore;

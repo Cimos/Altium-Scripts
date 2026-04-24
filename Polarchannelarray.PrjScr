@@ -67,7 +67,7 @@ GenerateClassCluster=0
 DocumentUniqueId=
 
 [Generic_ScriptingSystem]
-StartProcName=PolarChannelArray.pas>ArrangeRoomsInPolarArray
+StartProcName=PolarChannelArray.pas>ArrangeChannelsInPolarArray
 
 [OutputGroup1]
 Name=Netlist Outputs
