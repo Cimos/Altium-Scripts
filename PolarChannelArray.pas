@@ -1,9 +1,31 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v11
+  PolarChannelArray.pas  -- REVISED v12
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
 
   ================================================================
-  WHAT CHANGED FROM v10
+  WHAT CHANGED FROM v11
+  ================================================================
+  Bug fix: clicking a component inside the board outline used to fail
+  with the error "Could not derive a channel prefix from 'Inside Board
+  Components'". The cause was FindChannelClassForComponent picking the
+  longest-named class the component was in -- but a component on a
+  board sits in (at least) THREE classes simultaneously: the user's
+  channel class (e.g. "U_DUTB", 6 chars), "All Components" (14 chars),
+  and "Inside Board Components" (23 chars). The longest-name heuristic
+  picked the wrong one because Altium's auto-classes have long names.
+
+  Fix: filter out Altium auto-maintained component classes before any
+  membership search. New helper IsBuiltInComponentClass (line ~125)
+  uses Cls.SuperClass first, with a name blacklist fallback for older
+  Altium builds. Applied at FindChannelClassForComponent,
+  CollectMatchingClasses, and DerivePrefixFromReference.
+
+  Also: if the user has a component selected before running, that is
+  used as the reference instead of prompting for a click. Pre-selection
+  saves a step when the user already knows which component to use.
+
+  ================================================================
+  WHAT CHANGED FROM v10 (v11 summary)
   ================================================================
   Reference channel is now selected by CLICKING any component in the
   reference channel on the PCB, instead of typing a class-name prefix.
@@ -127,6 +149,46 @@ begin
       Result := 'P:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X) + ',' + IntToStr(Prim.Y);
   end;
+end;
+
+{ ---------------------------------------------------------------------------
+  IsBuiltInComponentClass
+  Altium auto-creates 5 "system" component classes on every board:
+  "All Components", "Inside Board Components", "Outside Board Components",
+  "Top Side Components", "Bottom Side Components". Every component is a
+  member of at least three of them (All + one of Inside/Outside + one of
+  Top/Bottom), so a click-to-pick reference component returns several
+  classes when we test IsMember, and several auto-class names are longer
+  than the user channel class (e.g. "Inside Board Components" is 23 chars
+  vs "U_DUTB" at 6). Always exclude them from class searches.
+
+  IPCB_ObjectClass.SuperClass is True for auto-maintained classes (verified
+  on AD25), but for older Altium builds we wrap it in try/except and fall
+  through to a name blacklist if the property call raises a runtime error.
+--------------------------------------------------------------------------- }
+function IsBuiltInComponentClass(Cls : IPCB_ObjectClass) : Boolean;
+var
+  nm : String;
+  isSuper : Boolean;
+begin
+  isSuper := False;
+  try
+    isSuper := Cls.SuperClass;
+  except
+    isSuper := False;
+  end;
+  if isSuper then
+  begin
+    Result := True;
+    Exit;
+  end;
+
+  nm := Cls.Name;
+  Result := (CompareText(nm, 'All Components') = 0) or
+            (CompareText(nm, 'Inside Board Components') = 0) or
+            (CompareText(nm, 'Outside Board Components') = 0) or
+            (CompareText(nm, 'Top Side Components') = 0) or
+            (CompareText(nm, 'Bottom Side Components') = 0);
 end;
 
 { --------------------------------------------------------------------------- }
@@ -469,6 +531,7 @@ begin
   begin
     Cls := Prim;
     if (Cls.MemberKind = COMP_CLASS_MEMBER_KIND) and
+       (not IsBuiltInComponentClass(Cls)) and
        (AnsiUpperCase(Copy(Cls.Name, 1, Length(prefix))) =
         AnsiUpperCase(prefix)) and
        (CountClassMembers(Board, Cls) > 0) then
@@ -622,6 +685,59 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  FindSelectedComponent
+  If the user has a component (or a primitive belonging to one) selected
+  before running the script, return it. This skips the click prompt for
+  users who already know which component to use. Returns Nil if nothing
+  useful is selected.
+
+  Note: Board.SelectecObjectCount / SelectecObject[i] uses the Altium
+  type-library's well-known typo (sic). The whole body is wrapped in
+  try/except so that on any Altium build that doesn't expose these
+  properties (or where access raises) the function safely returns Nil
+  and the caller falls through to the click prompt -- the script keeps
+  working, the user just doesn't get the selected-skip-the-click
+  shortcut.
+--------------------------------------------------------------------------- }
+function FindSelectedComponent(Board : IPCB_Board) : IPCB_Component;
+var
+  i, n : Integer;
+  Prim : IPCB_Primitive;
+  fallbackComp : IPCB_Component;
+begin
+  Result := Nil;
+  fallbackComp := Nil;
+
+  try
+    n := Board.SelectecObjectCount;
+  except
+    n := 0;                  { property absent on this Altium build }
+  end;
+
+  for i := 0 to n - 1 do
+  begin
+    Prim := Nil;
+    try
+      Prim := Board.SelectecObject[i];
+    except
+      Prim := Nil;
+    end;
+    if Prim = Nil then Continue;
+
+    if Prim.ObjectId = eComponentObject then
+    begin
+      Result := Prim;
+      Exit;
+    end;
+
+    if (fallbackComp = Nil) and (Prim.Component <> Nil) then
+      fallbackComp := Prim.Component;
+  end;
+
+  Result := fallbackComp;
+end;
+
+{ ---------------------------------------------------------------------------
   FindComponentAtLocation
   Returns the component whose bounding box contains (X, Y). If none
   contains the click, returns the nearest component within a reasonable
@@ -697,7 +813,9 @@ begin
   while Prim <> Nil do
   begin
     Cls := Prim;
-    if (Cls.MemberKind = COMP_CLASS_MEMBER_KIND) and Cls.IsMember(Comp) then
+    if (Cls.MemberKind = COMP_CLASS_MEMBER_KIND) and
+       (not IsBuiltInComponentClass(Cls)) and
+       Cls.IsMember(Comp) then
     begin
       if Length(Cls.Name) > Length(longestMatch) then
         longestMatch := Cls.Name;
@@ -740,6 +858,7 @@ begin
   begin
     Cls := Prim;
     if (Cls.MemberKind = COMP_CLASS_MEMBER_KIND) and
+       (not IsBuiltInComponentClass(Cls)) and
        (AnsiUpperCase(Cls.Name) <> AnsiUpperCase(refName)) and
        (CountClassMembers(Board, Cls) > 0) then
       AllClasses.Add(Cls.Name);
@@ -802,36 +921,45 @@ begin
     Exit;
   end;
 
-  { ---- Step 1: Ask user to click a component in the reference channel ----
-    Board.ChooseLocation puts Altium into crosshair mode. The user clicks
-    on (or near) any component belonging to the channel that defines the
-    template layout (e.g. a resistor in U_DUTB). The script resolves the
-    click to the nearest component, then reads its channel-specific class
-    membership to get the reference class name. }
-  ShowMessage('Step 1 of 2: Click on any COMPONENT in the REFERENCE channel.' + #13#10 + #13#10 +
-              'The component you click tells the script which channel is' + #13#10 +
-              'the reference. Every other channel in the detected set will' + #13#10 +
-              'be normalised to match the reference before the polar array' + #13#10 +
-              'is applied.' + #13#10 + #13#10 +
-              'Tip: click directly on a component pad or body for best results.');
+  { ---- Step 1: Pick a component in the reference channel ----
+    First check whether the user already has a component (or a primitive
+    of one) selected -- if so, use that and skip the click prompt.
+    Otherwise put Altium into crosshair mode and let the user click on
+    or near any component in the channel they want to use as the
+    reference layout (e.g. a resistor in U_DUTB). }
+  refComp := FindSelectedComponent(Board);
 
-  if not Board.ChooseLocation(refX, refY, 'Click a component in the reference channel') then
-    Exit;
-
-  refComp := FindComponentAtLocation(Board, refX, refY);
   if refComp = Nil then
   begin
-    ShowMessage('ERROR: No component found near the clicked location.' + #13#10 +
-                'Click closer to a component in the reference channel.');
-    Exit;
+    ShowMessage('Step 1 of 2: Click on any COMPONENT in the REFERENCE channel.' + #13#10 + #13#10 +
+                'The component you click tells the script which channel is' + #13#10 +
+                'the reference. Every other channel in the detected set will' + #13#10 +
+                'be normalised to match the reference before the polar array' + #13#10 +
+                'is applied.' + #13#10 + #13#10 +
+                'Tip: click directly on a component pad or body for best results.' + #13#10 +
+                'Tip: you can also pre-select a component before running this script.');
+
+    if not Board.ChooseLocation(refX, refY, 'Click a component in the reference channel') then
+      Exit;
+
+    refComp := FindComponentAtLocation(Board, refX, refY);
+    if refComp = Nil then
+    begin
+      ShowMessage('ERROR: No component found near the clicked location.' + #13#10 +
+                  'Click closer to a component in the reference channel.');
+      Exit;
+    end;
   end;
 
   refClassName := FindChannelClassForComponent(Board, refComp);
   if Trim(refClassName) = '' then
   begin
     ShowMessage('ERROR: The clicked component (' + refComp.Name.Text + ')' + #13#10 +
-                'does not belong to any component class.' + #13#10 +
-                'Multi-channel designs should have auto-generated classes.');
+                'does not belong to any USER-defined component class.' + #13#10 + #13#10 +
+                'Built-in classes (All Components / Inside Board /' + #13#10 +
+                'Outside Board Components) are skipped.' + #13#10 + #13#10 +
+                'Has the multi-channel project been compiled?' + #13#10 +
+                '(Project > Compile PCB Project regenerates channel classes.)');
     Exit;
   end;
 
