@@ -1,6 +1,36 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v13
+  PolarChannelArray.pas  -- REVISED v14
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
+
+  ================================================================
+  WHAT CHANGED FROM v13
+  ================================================================
+  Bug fix: ResetChannelsToMatchReference returned 0 matches on
+  boards where Altium's multi-channel compile decoupled the class
+  NAME from the per-component designator suffix.
+
+  Concrete failure (MotionJigBase, 2026-05-14): channel classes
+  named "U_DUTB".."U_DUTN" (letter-suffixed), but the components
+  inside them used the channel INDEX in their designators --
+  "M4_U_DUT1", "R3_U_DUT2", etc. The old v13 assumption
+  suffix = '_' + className searched for "_U_DUTB" at the end of
+  "M4_U_DUT1", never found it, every match attempt missed, all 12
+  non-reference channels reset 0 components, the polar transform
+  ran on free primitives only, and the components stayed in their
+  pre-script layout positions.
+
+  Fix: derive the per-class designator suffix EMPIRICALLY from the
+  longest common trailing substring of components in that class,
+  snapped to start with '_'. The suffix is computed once per class
+  at the start of ResetChannelsToMatchReference and stored in a
+  parallel TStringList. StripChannelSuffix and FindMatchingComponent
+  now take the pre-derived suffix instead of recomputing it from
+  the class name. Robust to whatever naming convention Altium's
+  multi-channel compile chose; works on the previous-known case
+  (class==suffix) and the newly-found one (class!=suffix).
+
+  Diagnostic that surfaced the bug: PolarChannelArray-Diagnostic.pas
+  (kept in repo for future debugging of similar mismatches).
 
   ================================================================
   WHAT CHANGED FROM v12
@@ -355,9 +385,91 @@ begin
   Board.BoardIterator_Destroy(Iter);
 end;
 
+{ ---------------------------------------------------------------------------
+  PrimitiveCentroidXY
+  Returns the (cx, cy) for a free primitive, or (0,0)+result=False if the
+  primitive's object kind isn't one we transform. Mirrors the centroid math
+  used inside TransformChannelFreePrimitives so the two stay in lockstep.
+--------------------------------------------------------------------------- }
+function PrimitiveCentroidXY(Prim : IPCB_Primitive;
+                             var cx, cy : TCoord) : Boolean;
+var
+  track : IPCB_Track;
+  via   : IPCB_Via;
+  arc   : IPCB_Arc;
+  txt   : IPCB_Text;
+  pad   : IPCB_Pad;
+begin
+  Result := True;
+  case Prim.ObjectId of
+    eTrackObject:
+    begin
+      track := Prim;
+      cx := (track.X1 + track.X2) div 2;
+      cy := (track.Y1 + track.Y2) div 2;
+    end;
+    eViaObject:
+    begin
+      via := Prim;
+      cx := via.X;
+      cy := via.Y;
+    end;
+    eArcObject:
+    begin
+      arc := Prim;
+      cx := arc.XCenter;
+      cy := arc.YCenter;
+    end;
+    eFillObject:
+    begin
+      cx := (Prim.X1Location + Prim.X2Location) div 2;
+      cy := (Prim.Y1Location + Prim.Y2Location) div 2;
+    end;
+    eTextObject:
+    begin
+      txt := Prim;
+      cx := txt.XLocation;
+      cy := txt.YLocation;
+    end;
+    ePadObject:
+    begin
+      pad := Prim;
+      cx := pad.X;
+      cy := pad.Y;
+    end;
+  else
+    begin
+      cx := 0;
+      cy := 0;
+      Result := False;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  IsPrimitiveOwnedBy
+  Returns True iff OwnerMap contains the exact entry 'key=chanIdx'.
+  Uses TStringList.IndexOf full-string match, which is binary-search when
+  OwnerMap.Sorted is True (verified API in this corpus: see DoneSet usage
+  at line ~1644 with the same Sorted+IndexOf pattern).
+
+  Implementation note: original draft used IndexOfName / ValueFromIndex
+  for cleaner code, but those are not in the verified TStringList API
+  surface for this Altium build. Full-string match is sufficient because
+  the caller already knows which chanIdx to ask about.
+--------------------------------------------------------------------------- }
+function IsPrimitiveOwnedBy(OwnerMap : TStringList;
+                            key      : String;
+                            chanIdx  : Integer) : Boolean;
+begin
+  Result := (OwnerMap.IndexOf(key + '=' + IntToStr(chanIdx)) >= 0);
+end;
+
 { --------------------------------------------------------------------------- }
-procedure TransformChannelFreePrimitives(Board   : IPCB_Board;
-                                         DoneSet : TStringList;
+procedure TransformChannelFreePrimitives(Board    : IPCB_Board;
+                                         DoneSet  : TStringList;
+                                         OwnerMap : TStringList;
+                                         chanIdx  : Integer;
                                          bx1, by1, bx2, by2 : TCoord;
                                          margin  : TCoord;
                                          oldCX, oldCY : TCoord;
@@ -396,10 +508,12 @@ begin
         if (track.Component = Nil) and
            PointInRect((track.X1 + track.X2) div 2,
                        (track.Y1 + track.Y2) div 2,
-                       bx1, by1, bx2, by2) then
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(track);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(track.X1, track.Y1, oldCX, oldCY, rotateDeg, tx,  ty);
@@ -415,10 +529,13 @@ begin
       begin
         via := Prim;
         if (via.Component = Nil) and
-           PointInRect(via.X, via.Y, bx1, by1, bx2, by2) then
+           PointInRect(via.X, via.Y,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(via);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(via.X, via.Y, oldCX, oldCY, rotateDeg, tx, ty);
@@ -433,10 +550,13 @@ begin
       begin
         arc := Prim;
         if (arc.Component = Nil) and
-           PointInRect(arc.XCenter, arc.YCenter, bx1, by1, bx2, by2) then
+           PointInRect(arc.XCenter, arc.YCenter,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(arc);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(arc.XCenter, arc.YCenter, oldCX, oldCY, rotateDeg, tx, ty);
@@ -458,10 +578,13 @@ begin
           fillHW := (Prim.X2Location - Prim.X1Location) div 2;
           fillHH := (Prim.Y2Location - Prim.Y1Location) div 2;
 
-          if PointInRect(fillCX, fillCY, bx1, by1, bx2, by2) then
+          if PointInRect(fillCX, fillCY,
+                         bx1 - margin, by1 - margin,
+                         bx2 + margin, by2 + margin) then
           begin
             key := PrimitiveKey(Prim);
-            if DoneSet.IndexOf(key) < 0 then
+            if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
             begin
               DoneSet.Add(key);
               RotatePointXY(fillCX, fillCY, oldCX, oldCY, rotateDeg, tx, ty);
@@ -480,10 +603,13 @@ begin
       begin
         txt := Prim;
         if (txt.Component = Nil) and
-           PointInRect(txt.XLocation, txt.YLocation, bx1, by1, bx2, by2) then
+           PointInRect(txt.XLocation, txt.YLocation,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(txt);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(txt.XLocation, txt.YLocation, oldCX, oldCY,
@@ -500,10 +626,13 @@ begin
       begin
         pad := Prim;
         if (pad.Component = Nil) and
-           PointInRect(pad.X, pad.Y, bx1, by1, bx2, by2) then
+           PointInRect(pad.X, pad.Y,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(pad);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(pad.X, pad.Y, oldCX, oldCY, rotateDeg, tx, ty);
@@ -574,25 +703,132 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  StripChannelSuffix
-  Removes the channel suffix from a designator. The suffix is the channel
-  class name preceded by an underscore, e.g.:
-    Designator "C1_U_DUTB", class "U_DUTB" -> "C1"
-    Designator "R3_U_DUTC", class "U_DUTC" -> "R3"
-  If the designator doesn't end with the suffix, returns the designator
-  unchanged. Case-insensitive.
+  SnapSuffixToUnderscore
+  Given a candidate suffix, return the longest tail that starts with '_'.
+  If no underscore exists in the candidate, returns empty (caller will then
+  treat the designator as un-suffixed and match by raw text).
+
+  Example: 'nion_U_DUT1' -> '_U_DUT1'
+           'A'           -> ''
+           '_X1'         -> '_X1'
 --------------------------------------------------------------------------- }
-function StripChannelSuffix(designator, className : String) : String;
+function SnapSuffixToUnderscore(suffix : String) : String;
 var
-  suffix : String;
+  i, l : Integer;
+begin
+  Result := '';
+  l := Length(suffix);
+  for i := 1 to l do
+  begin
+    if Copy(suffix, i, 1) = '_' then
+    begin
+      Result := Copy(suffix, i, l - i + 1);
+      Exit;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  DeriveClassSuffix
+  v14: derive the per-class designator suffix EMPIRICALLY from the longest
+  common trailing substring of all component designators in the class.
+
+  Background: Altium's multi-channel compile can decouple the class NAME
+  from the per-component channel suffix. Example seen on MotionJigBase
+  (2026-05-14 diagnostic): class names are letter-suffixed ("U_DUTB"..
+  "U_DUTN") but component designators carry the channel INDEX suffix
+  ("_U_DUT1".."_U_DUT13"). The old v13 assumption suffix='_'+className
+  produced 0 matches on every reset attempt.
+
+  Approach: take any one component in the class as the reference, then
+  shrink the common-trailing length against every other component. Snap
+  the result to start with '_' so the strip leaves a clean root. Empty
+  string is a valid output -- it means "no detectable channel suffix",
+  and StripChannelSuffix in that case is a no-op.
+--------------------------------------------------------------------------- }
+function DeriveClassSuffix(Board : IPCB_Board; Cls : IPCB_ObjectClass) : String;
+var
+  Iter        : IPCB_BoardIterator;
+  Comp        : IPCB_Component;
+  firstDesig  : String;
+  currentDesig: String;
+  haveFirst   : Boolean;
+  commonLen   : Integer;
+  l1, l2, minL, matchLen, i : Integer;
+begin
+  Result := '';
+  firstDesig := '';
+  haveFirst := False;
+  commonLen := 0;
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eComponentObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Comp := Iter.FirstPCBObject;
+  while Comp <> Nil do
+  begin
+    if Cls.IsMember(Comp) then
+    begin
+      currentDesig := Comp.Name.Text;
+      if not haveFirst then
+      begin
+        firstDesig := currentDesig;
+        commonLen := Length(firstDesig);
+        haveFirst := True;
+      end
+      else
+      begin
+        l1 := Length(firstDesig);
+        l2 := Length(currentDesig);
+        if l1 < l2 then minL := l1 else minL := l2;
+        matchLen := 0;
+        for i := 0 to minL - 1 do
+        begin
+          if AnsiUpperCase(Copy(firstDesig, l1 - i, 1)) =
+             AnsiUpperCase(Copy(currentDesig, l2 - i, 1)) then
+            matchLen := matchLen + 1
+          else
+            Break;
+        end;
+        if matchLen < commonLen then commonLen := matchLen;
+      end;
+    end;
+    Comp := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+
+  if haveFirst and (commonLen > 0) then
+    Result := SnapSuffixToUnderscore(
+                Copy(firstDesig, Length(firstDesig) - commonLen + 1, commonLen));
+end;
+
+{ ---------------------------------------------------------------------------
+  StripChannelSuffix
+  v14: takes the PRE-DERIVED suffix (use DeriveClassSuffix to compute it
+  once per class), not the class name. The suffix already includes its
+  leading '_' if any.
+
+  Designator "M4_U_DUT1", suffix "_U_DUT1" -> "M4"
+  Designator "R3_U_DUT2", suffix "_U_DUT2" -> "R3"
+  If the designator doesn't end with the suffix, returns the designator
+  unchanged. Empty suffix is a no-op. Case-insensitive.
+--------------------------------------------------------------------------- }
+function StripChannelSuffix(designator, classSuffix : String) : String;
+var
   desigLen, suffLen : Integer;
 begin
-  suffix := '_' + className;
+  if classSuffix = '' then
+  begin
+    Result := designator;
+    Exit;
+  end;
   desigLen := Length(designator);
-  suffLen := Length(suffix);
+  suffLen := Length(classSuffix);
   if (desigLen >= suffLen) and
      (AnsiUpperCase(Copy(designator, desigLen - suffLen + 1, suffLen)) =
-      AnsiUpperCase(suffix)) then
+      AnsiUpperCase(classSuffix)) then
     Result := Copy(designator, 1, desigLen - suffLen)
   else
     Result := designator;
@@ -600,13 +836,16 @@ end;
 
 { ---------------------------------------------------------------------------
   FindMatchingComponent
+  v14: takes the reference class's PRE-DERIVED suffix (from DeriveClass-
+  Suffix), not the class name.
+
   Looks through the given class for a component whose "root" designator
   (stripped of the class suffix) matches the target root. Returns Nil if
   not found.
 --------------------------------------------------------------------------- }
 function FindMatchingComponent(Board : IPCB_Board;
                                Cls : IPCB_ObjectClass;
-                               className : String;
+                               classSuffix : String;
                                targetRoot : String) : IPCB_Component;
 var
   Iter : IPCB_BoardIterator;
@@ -624,7 +863,7 @@ begin
   begin
     if Cls.IsMember(Comp) then
     begin
-      root := StripChannelSuffix(Comp.Name.Text, className);
+      root := StripChannelSuffix(Comp.Name.Text, classSuffix);
       if AnsiUpperCase(root) = AnsiUpperCase(targetRoot) then
       begin
         Result := Comp;
@@ -668,8 +907,25 @@ var
   otherCls : IPCB_ObjectClass;
   root : String;
   matched : Integer;
+  ChanSuffixes : TStringList;
+  refSuffix, otherSuffix : String;
 begin
   matched := 0;
+
+  { v14: pre-derive the per-class designator suffix EMPIRICALLY, once per
+    class. The class name and the per-component suffix are not always the
+    same (Altium can use the channel INDEX in designators while naming the
+    class for the sheet symbol -- see DeriveClassSuffix docs). }
+  ChanSuffixes := TStringList.Create;
+  for i := 0 to ChanNames.Count - 1 do
+  begin
+    otherCls := FindClassByName(Board, ChanNames[i]);
+    if otherCls <> Nil then
+      ChanSuffixes.Add(DeriveClassSuffix(Board, otherCls))
+    else
+      ChanSuffixes.Add('');
+  end;
+  refSuffix := ChanSuffixes[0];
 
   { For each non-reference channel }
   for i := 1 to ChanNames.Count - 1 do
@@ -677,6 +933,7 @@ begin
     otherClsName := ChanNames[i];
     otherCls := FindClassByName(Board, otherClsName);
     if otherCls = Nil then Continue;
+    otherSuffix := ChanSuffixes[i];
 
     { Walk every component in this other channel and copy the reference
       component's position and rotation into it. }
@@ -690,8 +947,8 @@ begin
     begin
       if otherCls.IsMember(Comp) then
       begin
-        root := StripChannelSuffix(Comp.Name.Text, otherClsName);
-        refComp := FindMatchingComponent(Board, RefCls, RefClsName, root);
+        root := StripChannelSuffix(Comp.Name.Text, otherSuffix);
+        refComp := FindMatchingComponent(Board, RefCls, refSuffix, root);
         if refComp <> Nil then
         begin
           { Copy absolute position and rotation from the reference
@@ -710,6 +967,7 @@ begin
     Board.BoardIterator_Destroy(CompIter);
   end;
 
+  ChanSuffixes.Free;
   Result := matched;
 end;
 
@@ -1025,6 +1283,104 @@ begin
   compCount := vals[6];
 end;
 
+{ ---------------------------------------------------------------------------
+  BuildPrimitiveOwnership
+  v14 fix for the bbox-overlap cross-claim hazard: when the pre-script
+  channel layout is tight (channels packed in a row with small gaps),
+  channel i's bbox+margin overlaps channel j's, and the spatial iterator
+  for channel i grabs primitives that visually belong to channel j. With
+  DoneSet dedup, only ONE channel claims each primitive -- but it's
+  whichever happens to iterate first, NOT necessarily the right one. The
+  result is the starburst / fan duplication seen on MotionJigBase 2026-05-14.
+
+  Fix: do a one-time pre-pass over every free primitive on the board,
+  assign each to the nearest pre-script channel center (Euclidean distance
+  in mm to avoid TCoord^2 overflow), reject any whose nearest is still
+  outside that channel's bbox+margin (= it's a global primitive, not in
+  any channel). Store as 'PrimitiveKey=chanIdx' lines in OwnerMap, looked
+  up later by TransformChannelFreePrimitives.
+
+  PreBBoxes : the CSV snapshot built by SnapshotChannelBBoxes.
+  OwnerMap  : preallocated TStringList; cleared and refilled.
+
+  Lives here (after GetBBoxFromSnapshot) because Pascal compilers need
+  callees declared before callers; GetBBoxFromSnapshot is used inside.
+--------------------------------------------------------------------------- }
+procedure BuildPrimitiveOwnership(Board     : IPCB_Board;
+                                  PreBBoxes : TStringList;
+                                  OwnerMap  : TStringList);
+var
+  Iter        : IPCB_BoardIterator;
+  Prim        : IPCB_Primitive;
+  primX, primY : TCoord;
+  i, bestI    : Integer;
+  preMinX, preMinY, preMaxX, preMaxY, preCX, preCY : TCoord;
+  preCount    : Integer;
+  dxm, dym, distSq, bestDistSq : Double;
+  bestMinX, bestMinY, bestMaxX, bestMaxY : TCoord;
+  margin      : TCoord;
+  key         : String;
+begin
+  OwnerMap.Clear;
+  OwnerMap.Sorted := True;
+  OwnerMap.Duplicates := dupIgnore;
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eTrackObject, eViaObject, eArcObject,
+                                  eFillObject, eTextObject, ePadObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Prim := Iter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    if (Prim.Component = Nil) and PrimitiveCentroidXY(Prim, primX, primY) then
+    begin
+      { Find the nearest channel center. Distance squared in mm-Double
+        space to avoid TCoord^2 overflow (TCoord is int32, channel pitches
+        of ~100 mm squared overflow 32-bit signed). }
+      bestI := -1;
+      bestDistSq := 0;
+      bestMinX := 0; bestMinY := 0; bestMaxX := 0; bestMaxY := 0;
+      for i := 0 to PreBBoxes.Count - 1 do
+      begin
+        GetBBoxFromSnapshot(PreBBoxes, i,
+                            preMinX, preMinY, preMaxX, preMaxY,
+                            preCX, preCY, preCount);
+        if preCount > 0 then
+        begin
+          dxm := CoordToMMs(primX - preCX);
+          dym := CoordToMMs(primY - preCY);
+          distSq := (dxm * dxm) + (dym * dym);
+          if (bestI < 0) or (distSq < bestDistSq) then
+          begin
+            bestDistSq := distSq;
+            bestI := i;
+            bestMinX := preMinX; bestMinY := preMinY;
+            bestMaxX := preMaxX; bestMaxY := preMaxY;
+          end;
+        end;
+      end;
+
+      { Confirm the primitive is inside the winning channel's bbox+margin.
+        If not, it's a global primitive and no channel owns it. }
+      if bestI >= 0 then
+      begin
+        margin := ComputeMargin(bestMinX, bestMinY, bestMaxX, bestMaxY);
+        if PointInRect(primX, primY,
+                       bestMinX - margin, bestMinY - margin,
+                       bestMaxX + margin, bestMaxY + margin) then
+        begin
+          key := PrimitiveKey(Prim);
+          OwnerMap.Add(key + '=' + IntToStr(bestI));
+        end;
+      end;
+    end;
+    Prim := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+end;
+
 { ===========================================================================
   ENTRY POINT
 =========================================================================== }
@@ -1036,6 +1392,7 @@ var
   ChanNames      : TStringList;  { matching channel class names }
   DoneSet        : TStringList;
   PreBBoxes      : TStringList;  { pre-reset bbox snapshot per channel idx }
+  OwnerMap       : TStringList;  { v14: 'primKey=chanIdx' per free primitive }
 
   i, N, compCount, refIdx : Integer;
   prefix, inputStr, refClassName : String;
@@ -1270,6 +1627,18 @@ begin
   PreBBoxes := TStringList.Create;
   SnapshotChannelBBoxes(Board, ChanNames, PreBBoxes);
 
+  { ---- Step 7a.5: Classify free primitives by nearest channel ----
+    v14 fix for the bbox-overlap cross-claim hazard. With tightly-packed
+    pre-script channels, bbox+margin windows overlap and the spatial
+    iterator for channel i can grab primitives that visually belong to
+    channel j. DoneSet dedupes -- but to the first claimant, not the right
+    one. Pre-classifying every free primitive by nearest channel center
+    (and confirming it's inside that channel's bbox+margin) gives a stable
+    per-primitive owner; the polar step then transforms each primitive in
+    exactly one channel iteration. }
+  OwnerMap := TStringList.Create;
+  BuildPrimitiveOwnership(Board, PreBBoxes, OwnerMap);
+
   { ---- Step 7b: Apply reset ---- }
   PCBServer.PreProcess;
   resetMatched := ResetChannelsToMatchReference(Board, Cls, ChanNames[0], ChanNames);
@@ -1309,18 +1678,24 @@ begin
     { Free primitives: pulled from the pre-reset bbox snapshot, because
       the reset step did not move free primitives. The spatial query
       region is the channel's original (pre-script) bbox; the rotation
-      pivot is the original bbox centre. This is the v13 fix for the
-      "random track / via location" bug from v12. }
+      pivot is the original bbox centre (so the internal cluster geometry
+      stays intact through rotation). v14 fix: the TRANSLATION target is
+      newCX/newCY (where the components landed) -- NOT newPreCX/newPreCY
+      (where the pre-script cluster centre rotates to). The two differ by
+      the radial offset (refCX,refCY)<->(preCX,preCY), and using
+      newPreCX/newPreCY left primitives on a different ring from their
+      components. Channels are identical by multi-channel compile, so
+      primitive-offset-from-preCX == component-offset-from-refCX --
+      translating to newCX/newCY aligns them. }
     GetBBoxFromSnapshot(PreBBoxes, i,
                         preMinX, preMinY, preMaxX, preMaxY,
                         preCX, preCY, preCount);
     if preCount > 0 then
     begin
       margin := ComputeMargin(preMinX, preMinY, preMaxX, preMaxY);
-      RotatePointXY(preCX, preCY, CX, CY, rotateDeg, newPreCX, newPreCY);
-      TransformChannelFreePrimitives(Board, DoneSet,
+      TransformChannelFreePrimitives(Board, DoneSet, OwnerMap, i,
                                       preMinX, preMinY, preMaxX, preMaxY, margin,
-                                      preCX, preCY, newPreCX, newPreCY, rotateDeg);
+                                      preCX, preCY, newCX, newCY, rotateDeg);
     end;
   end;
 
@@ -1337,5 +1712,6 @@ begin
 
   DoneSet.Free;
   PreBBoxes.Free;
+  OwnerMap.Free;
   ChanNames.Free;
 end;
