@@ -1,9 +1,38 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v12
+  PolarChannelArray.pas  -- REVISED v13
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
 
   ================================================================
-  WHAT CHANGED FROM v11
+  WHAT CHANGED FROM v12
+  ================================================================
+  Bug fix: free tracks / vias / arcs / fills / text / free pads
+  belonging to non-reference channels were ending up at random
+  positions after the polar array ran.
+
+  Root cause: TransformChannelFreePrimitives was being called with
+  the POST-reset bounding box -- which, for every non-reference
+  channel, is identical to the reference channel's bounding box
+  (because the reset step copies non-reference components to the
+  reference position). The spatial iterator therefore looked for
+  channel C's free primitives at the REFERENCE location, found
+  none (the free primitives weren't moved by reset), and instead
+  picked up the REFERENCE channel's free primitives. Because the
+  DoneSet dedupes, the reference channel's tracks got rotated to
+  the first non-reference channel's destination on the first
+  iteration, never moved again, and every subsequent channel
+  found no primitives in its query area at all.
+
+  Fix: snapshot each channel's bounding box BEFORE the reset step
+  runs. In the polar step, free-primitive transforms use the
+  channel's pre-reset bounding box for both the spatial query
+  region and the rotation pivot. Components still use the post-
+  reset (= reference) bounding box, because that's where they
+  are when the polar step runs.
+
+  New helpers: SnapshotChannelBBoxes, GetBBoxFromSnapshot.
+
+  ================================================================
+  WHAT CHANGED FROM v11 (v12 summary)
   ================================================================
   Bug fix: clicking a component inside the board outline used to fail
   with the error "Could not derive a channel prefix from 'Inside Board
@@ -889,6 +918,90 @@ begin
   AllClasses.Free;
 end;
 
+{ ---------------------------------------------------------------------------
+  SnapshotChannelBBoxes
+  Records each channel's pre-reset bounding box and component count
+  into BBoxes (one CSV line per channel index). Must be called BEFORE
+  ResetChannelsToMatchReference runs -- the whole point is to capture
+  the state of the board as the user laid it out, so the polar step
+  can later transform free primitives that were not moved by the
+  reset step.
+
+  CSV format per entry: "minX,minY,maxX,maxY,cx,cy,count" (TCoord
+  integers as strings, count as integer).
+
+  Index 0 of BBoxes corresponds to the reference channel (which is
+  never reset, so its snapshot equals its post-reset state).
+--------------------------------------------------------------------------- }
+procedure SnapshotChannelBBoxes(Board     : IPCB_Board;
+                                ChanNames : TStringList;
+                                BBoxes    : TStringList);
+var
+  i, compCount : Integer;
+  minX, minY, maxX, maxY, cx, cy : TCoord;
+  Cls : IPCB_ObjectClass;
+  csv : String;
+begin
+  BBoxes.Clear;
+  for i := 0 to ChanNames.Count - 1 do
+  begin
+    Cls := FindClassByName(Board, ChanNames[i]);
+    if Cls = Nil then
+    begin
+      BBoxes.Add('0,0,0,0,0,0,0');
+      Continue;
+    end;
+    ComputeChannelBBox(Board, Cls, minX, minY, maxX, maxY, compCount);
+    cx := (minX + maxX) div 2;
+    cy := (minY + maxY) div 2;
+    csv := IntToStr(minX) + ',' + IntToStr(minY) + ',' +
+           IntToStr(maxX) + ',' + IntToStr(maxY) + ',' +
+           IntToStr(cx)   + ',' + IntToStr(cy)   + ',' +
+           IntToStr(compCount);
+    BBoxes.Add(csv);
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  GetBBoxFromSnapshot
+  Parses entry idx of BBoxes back into TCoord values. Returns
+  compCount = 0 if the snapshot row is missing or malformed (caller
+  should skip that channel).
+--------------------------------------------------------------------------- }
+procedure GetBBoxFromSnapshot(BBoxes : TStringList;
+                              idx    : Integer;
+                              var minX, minY, maxX, maxY, cx, cy : TCoord;
+                              var compCount : Integer);
+var
+  parts : TStringList;
+  csv : String;
+begin
+  minX := 0; minY := 0; maxX := 0; maxY := 0;
+  cx   := 0; cy   := 0; compCount := 0;
+
+  if (idx < 0) or (idx >= BBoxes.Count) then Exit;
+
+  csv := BBoxes[idx];
+  parts := TStringList.Create;
+  try
+    parts.Delimiter := ',';
+    parts.StrictDelimiter := True;
+    parts.DelimitedText := csv;
+    if parts.Count = 7 then
+    begin
+      minX := StrToIntDef(parts[0], 0);
+      minY := StrToIntDef(parts[1], 0);
+      maxX := StrToIntDef(parts[2], 0);
+      maxY := StrToIntDef(parts[3], 0);
+      cx   := StrToIntDef(parts[4], 0);
+      cy   := StrToIntDef(parts[5], 0);
+      compCount := StrToIntDef(parts[6], 0);
+    end;
+  finally
+    parts.Free;
+  end;
+end;
+
 { ===========================================================================
   ENTRY POINT
 =========================================================================== }
@@ -899,6 +1012,7 @@ var
 
   ChanNames      : TStringList;  { matching channel class names }
   DoneSet        : TStringList;
+  PreBBoxes      : TStringList;  { pre-reset bbox snapshot per channel idx }
 
   i, N, compCount, refIdx : Integer;
   prefix, inputStr, refClassName : String;
@@ -907,12 +1021,15 @@ var
   refX, refY : TCoord;
   refComp   : IPCB_Component;
   rotateDeg : Double;
-  newCX, newCY, oldCX, oldCY : TCoord;
+  newCX, newCY : TCoord;
   minX, minY, maxX, maxY, margin : TCoord;
   refCX, refCY : TCoord;
   refR_mm : Double;
   summary : String;
   resetMatched : Integer;
+  preMinX, preMinY, preMaxX, preMaxY : TCoord;
+  preCX, preCY, newPreCX, newPreCY : TCoord;
+  preCount : Integer;
 begin
   Board := PCBServer.GetCurrentPCBBoard;
   if Board = Nil then
@@ -1120,7 +1237,17 @@ begin
     Exit;
   end;
 
-  { ---- Step 7: Apply reset ---- }
+  { ---- Step 7a: Snapshot each channel's pre-reset bbox ----
+    Captures bbox per channel BEFORE the reset step moves components.
+    The polar step needs this so free primitives (tracks / vias / etc.)
+    can be transformed using the channel's true original location, not
+    the reference location they collapse to after reset. v12 bug:
+    polar step used post-reset bbox for everything; free primitives
+    ended up at random positions. }
+  PreBBoxes := TStringList.Create;
+  SnapshotChannelBBoxes(Board, ChanNames, PreBBoxes);
+
+  { ---- Step 7b: Apply reset ---- }
   PCBServer.PreProcess;
   resetMatched := ResetChannelsToMatchReference(Board, Cls, ChanNames[0], ChanNames);
   PCBServer.PostProcess;
@@ -1146,22 +1273,32 @@ begin
     Cls := FindClassByName(Board, ChanNames[i]);
     if Cls = Nil then Continue;
 
-    ComputeChannelBBox(Board, Cls, minX, minY, maxX, maxY, compCount);
-    if compCount = 0 then Continue;
-
-    oldCX  := (minX + maxX) div 2;
-    oldCY  := (minY + maxY) div 2;
-    margin := ComputeMargin(minX, minY, maxX, maxY);
-
     rotateDeg := i * (360.0 / N);
+
+    { Components: after reset, channel i's components sit on top of the
+      reference channel's components. Old centre is therefore the
+      reference bbox centre; new centre is that centre rotated around
+      the polar origin. }
     RotatePointXY(refCX, refCY, CX, CY, rotateDeg, newCX, newCY);
-
     TransformChannelComponents(Board, Cls,
-                                oldCX, oldCY, newCX, newCY, rotateDeg);
+                                refCX, refCY, newCX, newCY, rotateDeg);
 
-    TransformChannelFreePrimitives(Board, DoneSet,
-                                    minX, minY, maxX, maxY, margin,
-                                    oldCX, oldCY, newCX, newCY, rotateDeg);
+    { Free primitives: pulled from the pre-reset bbox snapshot, because
+      the reset step did not move free primitives. The spatial query
+      region is the channel's original (pre-script) bbox; the rotation
+      pivot is the original bbox centre. This is the v13 fix for the
+      "random track / via location" bug from v12. }
+    GetBBoxFromSnapshot(PreBBoxes, i,
+                        preMinX, preMinY, preMaxX, preMaxY,
+                        preCX, preCY, preCount);
+    if preCount > 0 then
+    begin
+      margin := ComputeMargin(preMinX, preMinY, preMaxX, preMaxY);
+      RotatePointXY(preCX, preCY, CX, CY, rotateDeg, newPreCX, newPreCY);
+      TransformChannelFreePrimitives(Board, DoneSet,
+                                      preMinX, preMinY, preMaxX, preMaxY, margin,
+                                      preCX, preCY, newPreCX, newPreCY, rotateDeg);
+    end;
   end;
 
   PCBServer.PostProcess;
@@ -1176,5 +1313,6 @@ begin
               'Next: Tools > Polygon Pours > Repour All, then run DRC.');
 
   DoneSet.Free;
+  PreBBoxes.Free;
   ChanNames.Free;
 end;
