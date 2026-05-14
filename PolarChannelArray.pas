@@ -465,16 +465,23 @@ begin
   Result := (OwnerMap.IndexOf(key + '=' + IntToStr(chanIdx)) >= 0);
 end;
 
-{ --------------------------------------------------------------------------- }
-procedure TransformChannelFreePrimitives(Board    : IPCB_Board;
-                                         DoneSet  : TStringList;
-                                         OwnerMap : TStringList;
-                                         chanIdx  : Integer;
-                                         bx1, by1, bx2, by2 : TCoord;
-                                         margin  : TCoord;
-                                         oldCX, oldCY : TCoord;
-                                         newCX, newCY : TCoord;
-                                         rotateDeg    : Double);
+{ ---------------------------------------------------------------------------
+  TransformChannelFreePrimitives
+  v14.1: changed from procedure to function. Returns the number of free
+  primitives actually transformed in this call (excludes DoneSet-deduped
+  and ownership-skipped). Per-channel transform count is the main diagnostic
+  signal for the cross-claim hypothesis -- if owned and transformed counts
+  don't match across channels, classification or rotation is dropping work.
+--------------------------------------------------------------------------- }
+function TransformChannelFreePrimitives(Board    : IPCB_Board;
+                                        DoneSet  : TStringList;
+                                        OwnerMap : TStringList;
+                                        chanIdx  : Integer;
+                                        bx1, by1, bx2, by2 : TCoord;
+                                        margin  : TCoord;
+                                        oldCX, oldCY : TCoord;
+                                        newCX, newCY : TCoord;
+                                        rotateDeg    : Double) : Integer;
 var
   Iter : IPCB_SpatialIterator;
   Prim : IPCB_Primitive;
@@ -482,6 +489,7 @@ var
   tx, ty, tx2, ty2 : TCoord;
   fillCX, fillCY, fillHW, fillHH : TCoord;
   key  : String;
+  xformedCount : Integer;
 
   track : IPCB_Track;
   via   : IPCB_Via;
@@ -489,6 +497,7 @@ var
   txt   : IPCB_Text;
   pad   : IPCB_Pad;
 begin
+  xformedCount := 0;
   dX := newCX - oldCX;
   dY := newCY - oldCY;
 
@@ -521,6 +530,7 @@ begin
             track.X1 := tx  + dX;  track.Y1 := ty  + dY;
             track.X2 := tx2 + dX;  track.Y2 := ty2 + dY;
             track.GraphicallyInvalidate;
+            xformedCount := xformedCount + 1;
           end;
         end;
       end;
@@ -542,6 +552,7 @@ begin
             via.X := tx + dX;
             via.Y := ty + dY;
             via.GraphicallyInvalidate;
+            xformedCount := xformedCount + 1;
           end;
         end;
       end;
@@ -565,6 +576,7 @@ begin
             arc.StartAngle := NormaliseAngle(arc.StartAngle + rotateDeg);
             arc.EndAngle   := NormaliseAngle(arc.EndAngle   + rotateDeg);
             arc.GraphicallyInvalidate;
+            xformedCount := xformedCount + 1;
           end;
         end;
       end;
@@ -594,6 +606,7 @@ begin
               Prim.Y2Location := (ty + dY) + fillHH;
               Prim.Rotation := NormaliseAngle(Prim.Rotation + rotateDeg);
               Prim.GraphicallyInvalidate;
+              xformedCount := xformedCount + 1;
             end;
           end;
         end;
@@ -618,6 +631,7 @@ begin
             txt.YLocation := ty + dY;
             txt.Rotation  := NormaliseAngle(txt.Rotation + rotateDeg);
             txt.GraphicallyInvalidate;
+            xformedCount := xformedCount + 1;
           end;
         end;
       end;
@@ -640,6 +654,7 @@ begin
             pad.Y := ty + dY;
             pad.Rotation := NormaliseAngle(pad.Rotation + rotateDeg);
             pad.GraphicallyInvalidate;
+            xformedCount := xformedCount + 1;
           end;
         end;
       end;
@@ -650,6 +665,7 @@ begin
   end; { while }
 
   Board.SpatialIterator_Destroy(Iter);
+  Result := xformedCount;
 end;
 
 { --------------------------------------------------------------------------- }
@@ -1284,6 +1300,31 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  CountOwnedByChannel
+  v14.1 diagnostic: scan OwnerMap and count entries owned by chanIdx.
+  Each entry is 'key=chanIdx', so we test the suffix.
+--------------------------------------------------------------------------- }
+function CountOwnedByChannel(OwnerMap : TStringList; chanIdx : Integer) : Integer;
+var
+  suffix : String;
+  i, suffLen, count, sLen : Integer;
+  s : String;
+begin
+  suffix := '=' + IntToStr(chanIdx);
+  suffLen := Length(suffix);
+  count := 0;
+  for i := 0 to OwnerMap.Count - 1 do
+  begin
+    s := OwnerMap[i];
+    sLen := Length(s);
+    if (sLen >= suffLen) and
+       (Copy(s, sLen - suffLen + 1, suffLen) = suffix) then
+      count := count + 1;
+  end;
+  Result := count;
+end;
+
+{ ---------------------------------------------------------------------------
   BuildPrimitiveOwnership
   v14 fix for the bbox-overlap cross-claim hazard: when the pre-script
   channel layout is tight (channels packed in a row with small gaps),
@@ -1393,6 +1434,11 @@ var
   DoneSet        : TStringList;
   PreBBoxes      : TStringList;  { pre-reset bbox snapshot per channel idx }
   OwnerMap       : TStringList;  { v14: 'primKey=chanIdx' per free primitive }
+  DiagLog        : TStringList;  { v14.1: per-channel ownership/transform diag }
+  chanXfmCount   : Integer;
+  chanOwnCount   : Integer;
+  diagPath       : String;
+  diagBreakdown  : String;
 
   i, N, compCount, refIdx : Integer;
   prefix, inputStr, refClassName : String;
@@ -1639,6 +1685,17 @@ begin
   OwnerMap := TStringList.Create;
   BuildPrimitiveOwnership(Board, PreBBoxes, OwnerMap);
 
+  { v14.1 diagnostic: per-channel breakdown of ownership + transform.
+    Format per line: 'i  ChanName  owned=NNNN  xformed=NNNN'. Channel 0
+    (reference) has xformed=- because the polar loop skips it. }
+  DiagLog := TStringList.Create;
+  DiagLog.Add('=== PolarChannelArray v14.1 diagnostic ===');
+  DiagLog.Add('Date/time: ' + DateTimeToStr(Now));
+  DiagLog.Add('Channels detected: ' + IntToStr(ChanNames.Count));
+  DiagLog.Add('OwnerMap total entries: ' + IntToStr(OwnerMap.Count));
+  DiagLog.Add('');
+  DiagLog.Add('chanIdx  ClassName       owned    xformed');
+
   { ---- Step 7b: Apply reset ---- }
   PCBServer.PreProcess;
   resetMatched := ResetChannelsToMatchReference(Board, Cls, ChanNames[0], ChanNames);
@@ -1658,6 +1715,10 @@ begin
   DoneSet.Duplicates := dupIgnore;
 
   PCBServer.PreProcess;
+
+  { v14.1: log channel 0 (reference, owned but not transformed) before loop }
+  chanOwnCount := CountOwnedByChannel(OwnerMap, 0);
+  DiagLog.Add('0        ' + ChanNames[0] + '    ' + IntToStr(chanOwnCount) + '    - (ref)');
 
   { Skip i=0 (reference channel) -- no transformation applied }
   for i := 1 to N - 1 do
@@ -1690,28 +1751,67 @@ begin
     GetBBoxFromSnapshot(PreBBoxes, i,
                         preMinX, preMinY, preMaxX, preMaxY,
                         preCX, preCY, preCount);
+    chanXfmCount := 0;
     if preCount > 0 then
     begin
       margin := ComputeMargin(preMinX, preMinY, preMaxX, preMaxY);
-      TransformChannelFreePrimitives(Board, DoneSet, OwnerMap, i,
+      chanXfmCount := TransformChannelFreePrimitives(Board, DoneSet, OwnerMap, i,
                                       preMinX, preMinY, preMaxX, preMaxY, margin,
                                       preCX, preCY, newCX, newCY, rotateDeg);
     end;
+
+    { v14.1 diagnostic line for this channel }
+    chanOwnCount := CountOwnedByChannel(OwnerMap, i);
+    DiagLog.Add(IntToStr(i) + '        ' + ChanNames[i] +
+                '    ' + IntToStr(chanOwnCount) +
+                '    ' + IntToStr(chanXfmCount));
   end;
 
   PCBServer.PostProcess;
 
   Board.GraphicallyInvalidate;
 
+  { v14.1 diagnostic: write the per-channel breakdown to a log file
+    alongside the project, and include the first chunk in the dialog.
+    Verbose dialog is bounded to ~13 channel lines so it stays usable. }
+  DiagLog.Add('');
+  DiagLog.Add('Total DoneSet transforms: ' + IntToStr(DoneSet.Count));
+  DiagLog.Add('Reset matched components: ' + IntToStr(resetMatched));
+
+  { Build project-directory path by scanning Board.FileName backwards
+    for '\'. ExtractFilePath is not in the verified corpus on this build
+    -- the manual scan is the verified pattern (see
+    PolarChannelArray-Diagnostic.pas:916-921). }
+  diagPath := Board.FileName;
+  i := Length(diagPath);
+  while (i > 0) and (diagPath[i] <> '\') do i := i - 1;
+  diagPath := Copy(diagPath, 1, i);
+  if diagPath = '' then diagPath := 'C:\Temp\';
+  diagPath := diagPath + 'polar-array-v14.log';
+  try
+    DiagLog.SaveToFile(diagPath);
+  except
+    diagPath := '(failed to write log)';
+  end;
+
+  { Build a compact breakdown string for the dialog (one line per channel) }
+  diagBreakdown := '';
+  for i := 5 to DiagLog.Count - 4 do
+    diagBreakdown := diagBreakdown + DiagLog[i] + #13#10;
+
   ShowMessage('Done: ' + IntToStr(N) + ' channels arranged on a ' +
               FloatToStrF(refR_mm, ffFixed, 10, 3) + ' mm radius circle.' + #13#10 +
               IntToStr(DoneSet.Count) + ' free primitives transformed.' + #13#10 +
               'Reset snapped ' + IntToStr(resetMatched) + ' components to reference.' + #13#10 +
               'Reference ' + ChanNames[0] + ' was not moved.' + #13#10 + #13#10 +
+              'Per-channel breakdown (owned vs xformed):' + #13#10 +
+              diagBreakdown + #13#10 +
+              'Log: ' + diagPath + #13#10 + #13#10 +
               'Next: Tools > Polygon Pours > Repour All, then run DRC.');
 
   DoneSet.Free;
   PreBBoxes.Free;
   OwnerMap.Free;
+  DiagLog.Free;
   ChanNames.Free;
 end;
