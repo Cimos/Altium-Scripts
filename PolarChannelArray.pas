@@ -967,39 +967,62 @@ end;
   Parses entry idx of BBoxes back into TCoord values. Returns
   compCount = 0 if the snapshot row is missing or malformed (caller
   should skip that channel).
+
+  CSV is parsed manually using Pos / Copy rather than via
+  TStringList.DelimitedText -- DelphiScript on older Altium builds
+  does not always expose the StrictDelimiter property, and a missing
+  property raises a runtime error rather than a compile-time one.
+  Manual parsing also avoids the documented "DelimitedText treats
+  whitespace as a delimiter" quirk in non-strict mode.
 --------------------------------------------------------------------------- }
 procedure GetBBoxFromSnapshot(BBoxes : TStringList;
                               idx    : Integer;
                               var minX, minY, maxX, maxY, cx, cy : TCoord;
                               var compCount : Integer);
 var
-  parts : TStringList;
-  csv : String;
+  csv, token : String;
+  p, fieldIdx : Integer;
+  vals : array[0..6] of Integer;
 begin
   minX := 0; minY := 0; maxX := 0; maxY := 0;
   cx   := 0; cy   := 0; compCount := 0;
 
   if (idx < 0) or (idx >= BBoxes.Count) then Exit;
 
+  for fieldIdx := 0 to 6 do vals[fieldIdx] := 0;
+
   csv := BBoxes[idx];
-  parts := TStringList.Create;
-  try
-    parts.Delimiter := ',';
-    parts.StrictDelimiter := True;
-    parts.DelimitedText := csv;
-    if parts.Count = 7 then
+  fieldIdx := 0;
+
+  { Walk the CSV one comma at a time. After the loop, csv holds the
+    last (un-terminated) field. Stops at 7 fields to avoid overflow if
+    the snapshot row is malformed and contains extra commas. }
+  while (Length(csv) > 0) and (fieldIdx < 7) do
+  begin
+    p := Pos(',', csv);
+    if p = 0 then
     begin
-      minX := StrToIntDef(parts[0], 0);
-      minY := StrToIntDef(parts[1], 0);
-      maxX := StrToIntDef(parts[2], 0);
-      maxY := StrToIntDef(parts[3], 0);
-      cx   := StrToIntDef(parts[4], 0);
-      cy   := StrToIntDef(parts[5], 0);
-      compCount := StrToIntDef(parts[6], 0);
+      token := csv;
+      csv := '';
+    end
+    else
+    begin
+      token := Copy(csv, 1, p - 1);
+      csv := Copy(csv, p + 1, Length(csv) - p);
     end;
-  finally
-    parts.Free;
+    vals[fieldIdx] := StrToIntDef(Trim(token), 0);
+    fieldIdx := fieldIdx + 1;
   end;
+
+  if fieldIdx < 7 then Exit;  { malformed -- leave outputs at 0 }
+
+  minX      := vals[0];
+  minY      := vals[1];
+  maxX      := vals[2];
+  maxY      := vals[3];
+  cx        := vals[4];
+  cy        := vals[5];
+  compCount := vals[6];
 end;
 
 { ===========================================================================
