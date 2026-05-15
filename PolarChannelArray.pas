@@ -720,12 +720,14 @@ var
   firstDesig  : String;
   currentDesig: String;
   haveFirst   : Boolean;
+  observedMultiple : Boolean;
   commonLen   : Integer;
   l1, l2, minL, matchLen, i : Integer;
 begin
   Result := '';
   firstDesig := '';
   haveFirst := False;
+  observedMultiple := False;
   commonLen := 0;
 
   Iter := Board.BoardIterator_Create;
@@ -747,6 +749,7 @@ begin
       end
       else
       begin
+        observedMultiple := True;
         l1 := Length(firstDesig);
         l2 := Length(currentDesig);
         if l1 < l2 then minL := l1 else minL := l2;
@@ -766,7 +769,14 @@ begin
   end;
   Board.BoardIterator_Destroy(Iter);
 
-  if haveFirst and (commonLen > 0) then
+  { Single-component channel: commonLen is still Length(firstDesig) because
+    the cap-to-matchLen step never ran. The whole designator would be over-
+    claimed as the suffix, which is wrong (there is no "common trailing
+    substring" without a second sample). Return empty so StripChannelSuffix
+    becomes a no-op and the channel matches by raw designator -- which is
+    the safest fallback for a configuration the suffix-derivation cannot
+    resolve from observation. }
+  if haveFirst and observedMultiple and (commonLen > 0) then
     Result := SnapSuffixToUnderscore(
                 Copy(firstDesig, Length(firstDesig) - commonLen + 1, commonLen));
 end;
