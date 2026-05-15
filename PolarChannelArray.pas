@@ -1,6 +1,44 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v16
+  PolarChannelArray.pas  -- REVISED v17
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
+
+  ================================================================
+  WHAT CHANGED IN v17
+  ================================================================
+  Bug fix: add per-primitive PCBM_BeginModify / PCBM_EndModify
+  notifications around every X / Y / X1 / Y1 / X2 / Y2 / Rotation /
+  Layer / etc. write. Without these the in-memory field is updated and
+  GraphicallyInvalidate forces a redraw, BUT the PCB server's
+  undo-stack and spatial-index never learn the primitive moved. User-
+  visible symptom on bench 2026-05-15: "I can't select any of the
+  track work once it is moved by the script. Also Altium does not
+  recognise there is any changes so Ctrl-Z does not work. I normally
+  have to close the window."
+
+  Canonical idiom verified against the Altium-Designer-addons /
+  scripts-libraries / MoveAPdesignators.pas reference and the Altium
+  Developer "Delphi SDK How-to FAQ" -- the explicit guidance is "When
+  you modify the attributes of a PCB object, you need to invoke the
+  PCB board's DispatchMessage methods to refresh the PCB object" by
+  sending PCBM_BeginModify before and PCBM_EndModify after.
+
+  Implementation: two helpers near the top of the file --
+  BeginPrimChange(prim) and EndPrimChange(prim) -- each call
+  PCBServer.SendMessageToRobots with c_Broadcast and c_NoEventData.
+  IPCB_Component, IPCB_Track, IPCB_Via, IPCB_Arc, IPCB_Text, IPCB_Pad,
+  and IPCB_Fill all descend from IPCB_Primitive so the same helper
+  works for every object kind we mutate. Wrapped:
+
+    - TransformChannelComponents (Comp.X/Y/Rotation writes)
+    - TransformChannelFreePrimitives, all six cases
+      (Track.X1/Y1/X2/Y2, Via.X/Y, Arc.XCenter/YCenter/StartAngle/
+       EndAngle, Fill.X1Location/Y1Location/X2Location/Y2Location/
+       Rotation, Text.XLocation/YLocation/Rotation, Pad.X/Y/Rotation)
+    - ResetChannelsToMatchReference (Comp.X/Y/Rotation/Layer writes)
+
+  No geometric / algorithmic change. The cross-claim fix from v16
+  and the empirical-suffix fix from v15 are both preserved. v17 is
+  strictly a "make the PCB server learn about our changes" fix.
 
   ================================================================
   WHAT CHANGED IN v16
@@ -308,6 +346,52 @@ const
   MARGIN_MIN_MM          = 5.0;
   MARGIN_MAX_MM          = 50.0;
 
+{ ---------------------------------------------------------------------------
+  BeginPrimChange / EndPrimChange
+  v17: per-primitive change notification. Without these, attribute writes
+  to X / Y / X1 / Y1 / X2 / Y2 / Rotation / etc. update the in-memory
+  field but the PCB server's undo-stack and spatial-index do not learn
+  about the change. GraphicallyInvalidate forces a redraw, so the new
+  position is visible -- but the editor's selection, hit-testing, and
+  Ctrl-Z all operate on the stale index. User-visible symptom: "I can't
+  select the moved tracks, and Ctrl-Z does nothing -- I have to close
+  the document to reset state."
+
+  Canonical idiom verified against Altium-Designer-addons /
+  scripts-libraries / MoveAPdesignators.pas, and the Altium Developer
+  FAQ ("Delphi SDK How-to FAQ") explicit guidance: "When you modify the
+  attributes of a PCB object, you need to invoke the PCB board's
+  DispatchMessage methods to refresh the PCB object" -- PCBM_BeginModify
+  before each change, PCBM_EndModify after.
+
+  Wrap every modification site:
+
+    BeginPrimChange(Prim);
+    Prim.X := ...;
+    Prim.Y := ...;
+    Prim.GraphicallyInvalidate;
+    EndPrimChange(Prim);
+
+  IPCB_Component, IPCB_Track, IPCB_Via, IPCB_Arc, IPCB_Text, IPCB_Pad,
+  and IPCB_Fill all descend from IPCB_Primitive, so a single helper
+  works for every kind of object we mutate.
+--------------------------------------------------------------------------- }
+procedure BeginPrimChange(Prim : IPCB_Primitive);
+begin
+  PCBServer.SendMessageToRobots(Prim.I_ObjectAddress,
+                                c_Broadcast,
+                                PCBM_BeginModify,
+                                c_NoEventData);
+end;
+
+procedure EndPrimChange(Prim : IPCB_Primitive);
+begin
+  PCBServer.SendMessageToRobots(Prim.I_ObjectAddress,
+                                c_Broadcast,
+                                PCBM_EndModify,
+                                c_NoEventData);
+end;
+
 { --------------------------------------------------------------------------- }
 procedure RotatePointXY(ix, iy        : TCoord;
                         cx, cy        : TCoord;
@@ -531,11 +615,13 @@ begin
   begin
     if Cls.IsMember(Comp) then
     begin
+      BeginPrimChange(Comp);
       RotatePointXY(Comp.X, Comp.Y, oldCX, oldCY, rotateDeg, tx, ty);
       Comp.X := tx + dX;
       Comp.Y := ty + dY;
       Comp.Rotation := NormaliseAngle(Comp.Rotation + rotateDeg);
       Comp.GraphicallyInvalidate;
+      EndPrimChange(Comp);
     end;
     Comp := Iter.NextPCBObject;
   end;
@@ -675,11 +761,13 @@ begin
              IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
+            BeginPrimChange(track);
             RotatePointXY(track.X1, track.Y1, oldCX, oldCY, rotateDeg, tx,  ty);
             RotatePointXY(track.X2, track.Y2, oldCX, oldCY, rotateDeg, tx2, ty2);
             track.X1 := tx  + dX;  track.Y1 := ty  + dY;
             track.X2 := tx2 + dX;  track.Y2 := ty2 + dY;
             track.GraphicallyInvalidate;
+            EndPrimChange(track);
           end;
         end;
       end;
@@ -697,10 +785,12 @@ begin
              IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
+            BeginPrimChange(via);
             RotatePointXY(via.X, via.Y, oldCX, oldCY, rotateDeg, tx, ty);
             via.X := tx + dX;
             via.Y := ty + dY;
             via.GraphicallyInvalidate;
+            EndPrimChange(via);
           end;
         end;
       end;
@@ -718,12 +808,14 @@ begin
              IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
+            BeginPrimChange(arc);
             RotatePointXY(arc.XCenter, arc.YCenter, oldCX, oldCY, rotateDeg, tx, ty);
             arc.XCenter    := tx + dX;
             arc.YCenter    := ty + dY;
             arc.StartAngle := NormaliseAngle(arc.StartAngle + rotateDeg);
             arc.EndAngle   := NormaliseAngle(arc.EndAngle   + rotateDeg);
             arc.GraphicallyInvalidate;
+            EndPrimChange(arc);
           end;
         end;
       end;
@@ -746,6 +838,7 @@ begin
              IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
             begin
               DoneSet.Add(key);
+              BeginPrimChange(Prim);
               RotatePointXY(fillCX, fillCY, oldCX, oldCY, rotateDeg, tx, ty);
               Prim.X1Location := (tx + dX) - fillHW;
               Prim.Y1Location := (ty + dY) - fillHH;
@@ -753,6 +846,7 @@ begin
               Prim.Y2Location := (ty + dY) + fillHH;
               Prim.Rotation := NormaliseAngle(Prim.Rotation + rotateDeg);
               Prim.GraphicallyInvalidate;
+              EndPrimChange(Prim);
             end;
           end;
         end;
@@ -771,12 +865,14 @@ begin
              IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
+            BeginPrimChange(txt);
             RotatePointXY(txt.XLocation, txt.YLocation, oldCX, oldCY,
                           rotateDeg, tx, ty);
             txt.XLocation := tx + dX;
             txt.YLocation := ty + dY;
             txt.Rotation  := NormaliseAngle(txt.Rotation + rotateDeg);
             txt.GraphicallyInvalidate;
+            EndPrimChange(txt);
           end;
         end;
       end;
@@ -794,11 +890,13 @@ begin
              IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
+            BeginPrimChange(pad);
             RotatePointXY(pad.X, pad.Y, oldCX, oldCY, rotateDeg, tx, ty);
             pad.X := tx + dX;
             pad.Y := ty + dY;
             pad.Rotation := NormaliseAngle(pad.Rotation + rotateDeg);
             pad.GraphicallyInvalidate;
+            EndPrimChange(pad);
           end;
         end;
       end;
@@ -1128,12 +1226,17 @@ begin
         begin
           { Copy absolute position and rotation from the reference
             component. The whole channel ends up sitting exactly where
-            the reference sits. }
+            the reference sits. v17: wrap with BeginPrimChange/EndPrimChange
+            so the PCB server's undo-stack and spatial-index pick up the
+            move; otherwise the component is selectable at the old
+            location and Ctrl-Z does nothing. }
+          BeginPrimChange(Comp);
           Comp.X := refComp.X;
           Comp.Y := refComp.Y;
           Comp.Rotation := refComp.Rotation;
           Comp.Layer := refComp.Layer;
           Comp.GraphicallyInvalidate;
+          EndPrimChange(Comp);
           matched := matched + 1;
         end;
       end;
