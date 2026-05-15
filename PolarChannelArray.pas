@@ -1,13 +1,64 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v13
+  PolarChannelArray.pas  -- REVISED v14
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
 
   ================================================================
-  WHAT CHANGED FROM v12
+  WHAT CHANGED FROM v13
   ================================================================
-  Bug fix: free tracks / vias / arcs / fills / text / free pads
-  belonging to non-reference channels were ending up at random
-  positions after the polar array ran.
+  Bug fix: free tracks / vias / fills / text in non-reference channels
+  still ended up at the wrong polar slot whenever the channel was not
+  already at the reference position when the script ran (the common
+  case -- Altium dumps fresh multi-channel copies in a pile until the
+  user moves them).
+
+  v13 fixed the v12 spatial-query bug (query area was pointing at the
+  reference location instead of the channel's own area, so the
+  iterator gobbled up reference-channel tracks). It then ALSO changed
+  the rotation destination from rotate(refC) to rotate(preC, polarO),
+  which is a separate change and turned out to be wrong: it rotates
+  the track around the polar origin starting from the CHANNEL'S
+  ORIGINAL ARBITRARY LOCATION, while the components rotate around
+  the polar origin starting from the REFERENCE LOCATION. The two
+  destinations differ by the rotated channel offset, so tracks end
+  up at random-looking positions relative to their components.
+
+  Geometric fix (one-liner at the call site):
+
+      Components end at  newC = rotate(refC, polarO, theta)
+      Tracks should also end up at newC, with the same rotation,
+      so the track-to-component relative offset (which was identical
+      across channels at script-start in a multi-channel board) is
+      preserved after rotation.
+
+      Per-track point P (currently at preC + (P - preC) in absolute):
+        P_final = newC + R_theta(P - preC)
+
+      Equivalently in this script's "rotate-around-old, translate-by-
+      delta" form: keep the rotation pivot at preC (so the track
+      rotates rigidly around its OWN bbox centre), but translate by
+      (newC - preC), where newC is the COMPONENT destination, NOT
+      rotate(preC).
+
+  Implementation: the call site in ArrangeChannelsInPolarArray now
+  passes (newCX, newCY) -- the component-transform destination --
+  instead of (newPreCX, newPreCY) to TransformChannelFreePrimitives.
+  newPreCX / newPreCY become unused and are removed.
+
+  Worked example (N=3, channels arbitrary):
+    R at (10, 0), B at preC=(50, 50), polar origin (0, 0), B->120 deg.
+    B's track is at (50, 55) -- 5 mm above B's centre, matching the
+    relative offset of R's track at (10, 5).
+    Target = rotate((10, 5), origin, 120) = (-9.33, 6.16).
+    v13  -> (-72.63, 15.8) -- off by ~70 mm.
+    v14  -> (-9.33, 6.16). Matches target.
+
+  ================================================================
+  WHAT CHANGED FROM v12 (v13 summary)
+  ================================================================
+  Bug fix (partial): free tracks / vias / arcs / fills / text / free
+  pads belonging to non-reference channels were ending up at random
+  positions after the polar array ran. v13 fixed the spatial-query
+  half of this bug. See v14 above for the destination half.
 
   Root cause: TransformChannelFreePrimitives was being called with
   the POST-reset bounding box -- which, for every non-reference
@@ -22,12 +73,11 @@
   iteration, never moved again, and every subsequent channel
   found no primitives in its query area at all.
 
-  Fix: snapshot each channel's bounding box BEFORE the reset step
-  runs. In the polar step, free-primitive transforms use the
-  channel's pre-reset bounding box for both the spatial query
-  region and the rotation pivot. Components still use the post-
-  reset (= reference) bounding box, because that's where they
-  are when the polar step runs.
+  v13 fix: snapshot each channel's bounding box BEFORE the reset
+  step runs. In the polar step, free-primitive transforms use the
+  channel's pre-reset bounding box for the spatial query region.
+  Components still use the post-reset (= reference) bounding box,
+  because that's where they are when the polar step runs.
 
   New helpers: SnapshotChannelBBoxes, GetBBoxFromSnapshot.
 
@@ -1051,7 +1101,7 @@ var
   summary : String;
   resetMatched : Integer;
   preMinX, preMinY, preMaxX, preMaxY : TCoord;
-  preCX, preCY, newPreCX, newPreCY : TCoord;
+  preCX, preCY : TCoord;
   preCount : Integer;
 begin
   Board := PCBServer.GetCurrentPCBBoard;
@@ -1306,21 +1356,27 @@ begin
     TransformChannelComponents(Board, Cls,
                                 refCX, refCY, newCX, newCY, rotateDeg);
 
-    { Free primitives: pulled from the pre-reset bbox snapshot, because
-      the reset step did not move free primitives. The spatial query
-      region is the channel's original (pre-script) bbox; the rotation
-      pivot is the original bbox centre. This is the v13 fix for the
-      "random track / via location" bug from v12. }
+    { Free primitives: spatial query region is the channel's original
+      (pre-reset) bbox -- that's where the tracks actually sit, because
+      the reset step did not move them. The rotation pivot is the
+      channel's own pre-reset centre (preC), so the track rotates
+      rigidly around its own footprint. The destination is the
+      COMPONENT destination (newC = rotate(refC) around the polar
+      origin), NOT rotate(preC) -- so that after the transform the
+      tracks land alongside the components at the channel's polar
+      slot. v13 used rotate(preC) here, which placed tracks at the
+      rotated copy of the channel's original arbitrary location and
+      pulled them away from their components. See v14 changelog at
+      the top of this file for the worked geometry. }
     GetBBoxFromSnapshot(PreBBoxes, i,
                         preMinX, preMinY, preMaxX, preMaxY,
                         preCX, preCY, preCount);
     if preCount > 0 then
     begin
       margin := ComputeMargin(preMinX, preMinY, preMaxX, preMaxY);
-      RotatePointXY(preCX, preCY, CX, CY, rotateDeg, newPreCX, newPreCY);
       TransformChannelFreePrimitives(Board, DoneSet,
                                       preMinX, preMinY, preMaxX, preMaxY, margin,
-                                      preCX, preCY, newPreCX, newPreCY, rotateDeg);
+                                      preCX, preCY, newCX, newCY, rotateDeg);
     end;
   end;
 
