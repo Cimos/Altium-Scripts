@@ -1,6 +1,38 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v15
+  PolarChannelArray.pas  -- REVISED v15.2
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
+
+  ================================================================
+  WHAT CHANGED IN v15.2
+  ================================================================
+  Bug fix: restore the 25 % bbox-margin extension in the per-primitive
+  PointInRect filter inside TransformChannelFreePrimitives. v15 left the
+  margin on the spatial iterator (AddFilter_Area at lines ~476-477) but
+  silently stripped it from the six PointInRect checks inside the loop.
+  Result: the iterator surfaced free primitives sitting in the margin
+  band (just outside the components' raw bounding box), the PointInRect
+  centroid test then rejected them, and they were left at their pre-
+  rotation position. Visible symptom: "all the track work is still off"
+  -- components rotate correctly, but routing tracks adjacent to but
+  outside the raw component cluster stay behind.
+
+  The fix is one-line per primitive type (track / via / arc / fill /
+  text / pad): change PointInRect(..., bx1, by1, bx2, by2) to
+  PointInRect(..., bx1 - margin, by1 - margin, bx2 + margin, by2 + margin).
+  This matches the spatial iterator's AddFilter_Area on the same call --
+  iterator and centroid filter are now consistent. The 25 % margin
+  promised by README sections "Automatic reset" and "Stragglers left
+  behind" is restored.
+
+  Latent risk this fix re-exposes: bbox-overlap cross-claim on tight pre-
+  script layouts where channel bbox+margin regions intersect. v14-1st
+  hedged this with BuildPrimitiveOwnership / OwnerMap (commit 613d526),
+  v14-final + v15 dropped it on the grounds that "channel bboxes don't
+  overlap" -- which is true for raw bboxes but NOT for bbox+margin. If
+  the next board surfaces the starburst / fan-duplication symptom (free
+  primitives showing up on more than one rotated channel), restore
+  ownership routing from 613d526 as v16. The geometric fix (newCX/newCY
+  destination, rotation pivot at preC) is untouched.
 
   ================================================================
   WHAT CHANGED FROM v14
@@ -487,7 +519,8 @@ begin
         if (track.Component = Nil) and
            PointInRect((track.X1 + track.X2) div 2,
                        (track.Y1 + track.Y2) div 2,
-                       bx1, by1, bx2, by2) then
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(track);
           if DoneSet.IndexOf(key) < 0 then
@@ -506,7 +539,9 @@ begin
       begin
         via := Prim;
         if (via.Component = Nil) and
-           PointInRect(via.X, via.Y, bx1, by1, bx2, by2) then
+           PointInRect(via.X, via.Y,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(via);
           if DoneSet.IndexOf(key) < 0 then
@@ -524,7 +559,9 @@ begin
       begin
         arc := Prim;
         if (arc.Component = Nil) and
-           PointInRect(arc.XCenter, arc.YCenter, bx1, by1, bx2, by2) then
+           PointInRect(arc.XCenter, arc.YCenter,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(arc);
           if DoneSet.IndexOf(key) < 0 then
@@ -549,7 +586,9 @@ begin
           fillHW := (Prim.X2Location - Prim.X1Location) div 2;
           fillHH := (Prim.Y2Location - Prim.Y1Location) div 2;
 
-          if PointInRect(fillCX, fillCY, bx1, by1, bx2, by2) then
+          if PointInRect(fillCX, fillCY,
+                         bx1 - margin, by1 - margin,
+                         bx2 + margin, by2 + margin) then
           begin
             key := PrimitiveKey(Prim);
             if DoneSet.IndexOf(key) < 0 then
@@ -571,7 +610,9 @@ begin
       begin
         txt := Prim;
         if (txt.Component = Nil) and
-           PointInRect(txt.XLocation, txt.YLocation, bx1, by1, bx2, by2) then
+           PointInRect(txt.XLocation, txt.YLocation,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(txt);
           if DoneSet.IndexOf(key) < 0 then
@@ -591,7 +632,9 @@ begin
       begin
         pad := Prim;
         if (pad.Component = Nil) and
-           PointInRect(pad.X, pad.Y, bx1, by1, bx2, by2) then
+           PointInRect(pad.X, pad.Y,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(pad);
           if DoneSet.IndexOf(key) < 0 then
