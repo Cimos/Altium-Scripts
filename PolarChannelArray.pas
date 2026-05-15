@@ -1,56 +1,97 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v14
+  PolarChannelArray.pas  -- REVISED v15
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
 
   ================================================================
-  WHAT CHANGED FROM v13
+  WHAT CHANGED FROM v14
   ================================================================
-  Bug fix: free tracks / vias / fills / text in non-reference channels
-  still ended up at the wrong polar slot whenever the channel was not
-  already at the reference position when the script ran (the common
-  case -- Altium dumps fresh multi-channel copies in a pile until the
-  user moves them).
+  Bug fix: restore the empirical channel-suffix derivation that v14-final
+  (1214a87) silently dropped when it stripped the ownership-routing
+  layer from v14-1st (613d526). On a board where component designators
+  do NOT end with '_' + className -- e.g. class "U_DUTB" but components
+  "M4_U_DUT1", "R3_U_DUT2" (MotionJigBase 2026-05-14) -- v14-final's
+  StripChannelSuffix returns the full designator, FindMatchingComponent
+  finds no match, ResetChannelsToMatchReference returns 0 matches, every
+  non-reference channel's components stay at their pre-script positions,
+  and the polar transform rotates them around refC anyway. Each channel
+  lands at a different radius from polarO and the result is the
+  "elliptical orbit growing as it goes around" pattern -- the SAME
+  symptom v14-1st had originally fixed.
 
-  v13 fixed the v12 spatial-query bug (query area was pointing at the
-  reference location instead of the channel's own area, so the
-  iterator gobbled up reference-channel tracks). It then ALSO changed
-  the rotation destination from rotate(refC) to rotate(preC, polarO),
-  which is a separate change and turned out to be wrong: it rotates
-  the track around the polar origin starting from the CHANNEL'S
-  ORIGINAL ARBITRARY LOCATION, while the components rotate around
-  the polar origin starting from the REFERENCE LOCATION. The two
-  destinations differ by the rotated channel offset, so tracks end
-  up at random-looking positions relative to their components.
+  Fix:
+    1. Re-add SnapSuffixToUnderscore (longest tail starting with '_').
+    2. Re-add DeriveClassSuffix (longest common trailing substring of
+       component designators in the class, snapped to start with '_').
+    3. StripChannelSuffix and FindMatchingComponent now take a PRE-
+       DERIVED suffix rather than reconstructing it from the class name.
+    4. ResetChannelsToMatchReference computes the suffix for every
+       channel once at the top, stores them in a parallel TStringList,
+       and feeds the per-channel suffix into StripChannelSuffix.
 
-  Geometric fix (one-liner at the call site):
+  Empty derived suffix is a valid result -- means the channel has only
+  one component (no trailing substring to align against) or has no
+  detectable common tail. StripChannelSuffix in that case is a no-op
+  (root = full designator). Works for the previous-known case
+  (class==suffix, e.g. class "U_DUTB" with designators "C1_U_DUTB")
+  AND the newly-found case (class!=suffix, e.g. class "U_DUTB" with
+  designator "M4_U_DUT1").
 
-      Components end at  newC = rotate(refC, polarO, theta)
-      Tracks should also end up at newC, with the same rotation,
-      so the track-to-component relative offset (which was identical
-      across channels at script-start in a multi-channel board) is
-      preserved after rotation.
+  The geometric fix is untouched (newCX/newCY destination for free
+  primitives, rotation pivot at preC). That part was correct in both
+  v14-1st and v14-final; only the suffix-derivation regression
+  produced the user-visible spiral on MotionJigBase.
 
-      Per-track point P (currently at preC + (P - preC) in absolute):
-        P_final = newC + R_theta(P - preC)
+  What v14-1st had that v15 does NOT bring back:
+    - BuildPrimitiveOwnership / OwnerMap / IsPrimitiveOwnedBy. This
+      was a hedge against bbox-overlap cross-claim on tight channel
+      layouts (multiple channels' bbox+margin regions intersecting,
+      primitives grabbed by whichever iteration ran first, "starburst"
+      symptom). v14-final dropped it on the grounds that the simple
+      "PointInRect inside raw bbox + DoneSet dedup" filter is
+      sufficient when channel bboxes don't overlap. If a future board
+      surfaces the starburst symptom, re-add ownership routing as v16
+      (lives in git history at 613d526).
+    - Per-channel diagnostic counters from v14.1 (f1f2fea).
 
-      Equivalently in this script's "rotate-around-old, translate-by-
-      delta" form: keep the rotation pivot at preC (so the track
-      rotates rigidly around its OWN bbox centre), but translate by
-      (newC - preC), where newC is the COMPONENT destination, NOT
-      rotate(preC).
+  Worked example (N=3, MotionJigBase-style naming):
+    Classes [U_DUTB, U_DUTC, U_DUTD], designators in U_DUTB end with
+    "_U_DUT1", in U_DUTC end with "_U_DUT2", in U_DUTD end with
+    "_U_DUT3". User clicks a component in U_DUTB (reference).
 
-  Implementation: the call site in ArrangeChannelsInPolarArray now
-  passes (newCX, newCY) -- the component-transform destination --
-  instead of (newPreCX, newPreCY) to TransformChannelFreePrimitives.
-  newPreCX / newPreCY become unused and are removed.
+    v14-final: StripChannelSuffix("M4_U_DUT2", "U_DUTC") looks for
+      suffix "_U_DUTC" at the end of "M4_U_DUT2" -- not found, returns
+      "M4_U_DUT2" unchanged. FindMatchingComponent in U_DUTB looks for
+      a component whose stripped root is "M4_U_DUT2" -- not found
+      (U_DUTB components strip to "M4", "R3", etc.). resetMatched=0,
+      U_DUTC components stay at preC, polar transform rotates them
+      around refC, U_DUTC cluster lands at refC + R(120)*(preC - refC)
+      which is NOT on the polar circle. Spiral pattern.
 
-  Worked example (N=3, channels arbitrary):
-    R at (10, 0), B at preC=(50, 50), polar origin (0, 0), B->120 deg.
-    B's track is at (50, 55) -- 5 mm above B's centre, matching the
-    relative offset of R's track at (10, 5).
-    Target = rotate((10, 5), origin, 120) = (-9.33, 6.16).
-    v13  -> (-72.63, 15.8) -- off by ~70 mm.
-    v14  -> (-9.33, 6.16). Matches target.
+    v15: DeriveClassSuffix(U_DUTC) walks every component in U_DUTC,
+      finds the longest common trailing substring "_U_DUT2", returns
+      "_U_DUT2" (after snap-to-underscore). StripChannelSuffix(
+      "M4_U_DUT2", "_U_DUT2") strips to "M4". FindMatchingComponent
+      in U_DUTB with refSuffix="_U_DUT1" finds component "M4_U_DUT1"
+      (strips to "M4"). MATCH. U_DUTC components reset to refC.
+      Polar transform lands them at newC on the polar circle.
+
+  ================================================================
+  WHAT CHANGED FROM v13 (v14 summary)
+  ================================================================
+  v14 made two changes that got entangled:
+    1. (v14-1st, 613d526) Empirical-suffix derivation so reset works
+       on boards where Altium decoupled class name from designator
+       suffix. Silently reverted in v14-final; restored in v15.
+    2. (v14-1st through v14-final) Free-primitive destination: tracks
+       were landing at rotate(preC, polarO) -- a different ring from
+       components -- instead of newC = rotate(refC, polarO) alongside
+       components. One-liner at the call site (newCX/newCY instead of
+       newPreCX/newPreCY). Preserved in v15.
+
+       Components end at  newC = rotate(refC, polarO, theta).
+       Tracks end at      newC + R_theta(P - preC)
+                          -- preserves the track-to-component relative
+                          offset under rotation.
 
   ================================================================
   WHAT CHANGED FROM v12 (v13 summary)
@@ -624,25 +665,138 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  StripChannelSuffix
-  Removes the channel suffix from a designator. The suffix is the channel
-  class name preceded by an underscore, e.g.:
-    Designator "C1_U_DUTB", class "U_DUTB" -> "C1"
-    Designator "R3_U_DUTC", class "U_DUTC" -> "R3"
-  If the designator doesn't end with the suffix, returns the designator
-  unchanged. Case-insensitive.
+  SnapSuffixToUnderscore
+  Given a candidate suffix, return the longest tail that starts with '_'.
+  If no underscore exists in the candidate, returns empty (caller will
+  then treat the designator as un-suffixed and match by raw text).
+
+  Example: 'nion_U_DUT1' -> '_U_DUT1'
+           'A'           -> ''
+           '_X1'         -> '_X1'
 --------------------------------------------------------------------------- }
-function StripChannelSuffix(designator, className : String) : String;
+function SnapSuffixToUnderscore(suffix : String) : String;
 var
-  suffix : String;
+  i, l : Integer;
+begin
+  Result := '';
+  l := Length(suffix);
+  for i := 1 to l do
+  begin
+    if Copy(suffix, i, 1) = '_' then
+    begin
+      Result := Copy(suffix, i, l - i + 1);
+      Exit;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  DeriveClassSuffix
+  v15 (restored from v14-1st, 613d526): derive the per-class designator
+  suffix EMPIRICALLY from the longest common trailing substring of all
+  component designators in the class.
+
+  Background: Altium's multi-channel compile can decouple the class NAME
+  from the per-component channel suffix. Example seen on MotionJigBase
+  (2026-05-14 diagnostic): class names are letter-suffixed
+  ("U_DUTB" through "U_DUTN") but component designators carry the
+  channel INDEX suffix ("_U_DUT1" through "_U_DUT13"). The pre-v14
+  assumption suffix = '_' + className produced 0 matches on every
+  reset attempt -- which left non-reference channels at their pre-
+  script positions, and the polar transform produced the elliptical-
+  orbit-growing-as-it-goes-around pattern (every channel landing at
+  a different radius from polarO).
+
+  Approach: take any one component in the class as the reference, then
+  shrink the common-trailing length against every other component. Snap
+  the result to start with '_' so the strip leaves a clean root. Empty
+  string is a valid output -- it means "no detectable channel suffix",
+  and StripChannelSuffix in that case is a no-op.
+--------------------------------------------------------------------------- }
+function DeriveClassSuffix(Board : IPCB_Board; Cls : IPCB_ObjectClass) : String;
+var
+  Iter        : IPCB_BoardIterator;
+  Comp        : IPCB_Component;
+  firstDesig  : String;
+  currentDesig: String;
+  haveFirst   : Boolean;
+  commonLen   : Integer;
+  l1, l2, minL, matchLen, i : Integer;
+begin
+  Result := '';
+  firstDesig := '';
+  haveFirst := False;
+  commonLen := 0;
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eComponentObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Comp := Iter.FirstPCBObject;
+  while Comp <> Nil do
+  begin
+    if Cls.IsMember(Comp) then
+    begin
+      currentDesig := Comp.Name.Text;
+      if not haveFirst then
+      begin
+        firstDesig := currentDesig;
+        commonLen := Length(firstDesig);
+        haveFirst := True;
+      end
+      else
+      begin
+        l1 := Length(firstDesig);
+        l2 := Length(currentDesig);
+        if l1 < l2 then minL := l1 else minL := l2;
+        matchLen := 0;
+        for i := 0 to minL - 1 do
+        begin
+          if AnsiUpperCase(Copy(firstDesig, l1 - i, 1)) =
+             AnsiUpperCase(Copy(currentDesig, l2 - i, 1)) then
+            matchLen := matchLen + 1
+          else
+            Break;
+        end;
+        if matchLen < commonLen then commonLen := matchLen;
+      end;
+    end;
+    Comp := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+
+  if haveFirst and (commonLen > 0) then
+    Result := SnapSuffixToUnderscore(
+                Copy(firstDesig, Length(firstDesig) - commonLen + 1, commonLen));
+end;
+
+{ ---------------------------------------------------------------------------
+  StripChannelSuffix
+  v15: takes the PRE-DERIVED suffix (use DeriveClassSuffix to compute it
+  once per class), not the class name. The suffix already includes its
+  leading '_' if any.
+
+  Designator "M4_U_DUT1", suffix "_U_DUT1" -> "M4"
+  Designator "R3_U_DUT2", suffix "_U_DUT2" -> "R3"
+  Designator "C1_U_DUTB", suffix "_U_DUTB" -> "C1"  (clean class==suffix case)
+  If the designator doesn't end with the suffix, returns the designator
+  unchanged. Empty suffix is a no-op. Case-insensitive.
+--------------------------------------------------------------------------- }
+function StripChannelSuffix(designator, classSuffix : String) : String;
+var
   desigLen, suffLen : Integer;
 begin
-  suffix := '_' + className;
+  if classSuffix = '' then
+  begin
+    Result := designator;
+    Exit;
+  end;
   desigLen := Length(designator);
-  suffLen := Length(suffix);
+  suffLen := Length(classSuffix);
   if (desigLen >= suffLen) and
      (AnsiUpperCase(Copy(designator, desigLen - suffLen + 1, suffLen)) =
-      AnsiUpperCase(suffix)) then
+      AnsiUpperCase(classSuffix)) then
     Result := Copy(designator, 1, desigLen - suffLen)
   else
     Result := designator;
@@ -650,13 +804,16 @@ end;
 
 { ---------------------------------------------------------------------------
   FindMatchingComponent
+  v15: takes the reference class's PRE-DERIVED suffix (from DeriveClass-
+  Suffix), not the class name.
+
   Looks through the given class for a component whose "root" designator
   (stripped of the class suffix) matches the target root. Returns Nil if
   not found.
 --------------------------------------------------------------------------- }
 function FindMatchingComponent(Board : IPCB_Board;
                                Cls : IPCB_ObjectClass;
-                               className : String;
+                               classSuffix : String;
                                targetRoot : String) : IPCB_Component;
 var
   Iter : IPCB_BoardIterator;
@@ -674,7 +831,7 @@ begin
   begin
     if Cls.IsMember(Comp) then
     begin
-      root := StripChannelSuffix(Comp.Name.Text, className);
+      root := StripChannelSuffix(Comp.Name.Text, classSuffix);
       if AnsiUpperCase(root) = AnsiUpperCase(targetRoot) then
       begin
         Result := Comp;
@@ -718,8 +875,25 @@ var
   otherCls : IPCB_ObjectClass;
   root : String;
   matched : Integer;
+  ChanSuffixes : TStringList;
+  refSuffix, otherSuffix : String;
 begin
   matched := 0;
+
+  { v15: pre-derive the per-class designator suffix EMPIRICALLY, once per
+    class. The class name and the per-component suffix are not always the
+    same -- Altium can use the channel INDEX in designators while naming
+    the class for the sheet symbol. See DeriveClassSuffix docs. }
+  ChanSuffixes := TStringList.Create;
+  for i := 0 to ChanNames.Count - 1 do
+  begin
+    otherCls := FindClassByName(Board, ChanNames[i]);
+    if otherCls <> Nil then
+      ChanSuffixes.Add(DeriveClassSuffix(Board, otherCls))
+    else
+      ChanSuffixes.Add('');
+  end;
+  refSuffix := ChanSuffixes[0];
 
   { For each non-reference channel }
   for i := 1 to ChanNames.Count - 1 do
@@ -727,6 +901,7 @@ begin
     otherClsName := ChanNames[i];
     otherCls := FindClassByName(Board, otherClsName);
     if otherCls = Nil then Continue;
+    otherSuffix := ChanSuffixes[i];
 
     { Walk every component in this other channel and copy the reference
       component's position and rotation into it. }
@@ -740,8 +915,8 @@ begin
     begin
       if otherCls.IsMember(Comp) then
       begin
-        root := StripChannelSuffix(Comp.Name.Text, otherClsName);
-        refComp := FindMatchingComponent(Board, RefCls, RefClsName, root);
+        root := StripChannelSuffix(Comp.Name.Text, otherSuffix);
+        refComp := FindMatchingComponent(Board, RefCls, refSuffix, root);
         if refComp <> Nil then
         begin
           { Copy absolute position and rotation from the reference
@@ -760,6 +935,7 @@ begin
     Board.BoardIterator_Destroy(CompIter);
   end;
 
+  ChanSuffixes.Free;
   Result := matched;
 end;
 
