@@ -1,6 +1,70 @@
 {*******************************************************************************
-  PolarChannelArray.pas  -- REVISED v15.2
+  PolarChannelArray.pas  -- REVISED v16
   Altium DelphiScript -- Arrange channel "rooms" in a circular (polar) array.
+
+  ================================================================
+  WHAT CHANGED IN v16
+  ================================================================
+  Bug fix: restore the per-primitive ownership-routing layer that v14-1st
+  (commit 613d526) introduced for exactly the symptom seen on MotionJigBase
+  with 12 channels (bench observation 2026-05-15). v15.2 explicitly flagged
+  this re-exposure: "Latent risk this fix re-exposes: bbox-overlap cross-
+  claim on tight pre-script layouts where channel bbox+margin regions
+  intersect... If the next board surfaces the starburst / fan-duplication
+  symptom... restore ownership routing from 613d526 as v16." That board
+  arrived; v16 restores it.
+
+  User-observed symptom: "the second item in the array is bang on, but
+  everything from then on has a rotation that it should not have."
+  Diagnosis (cross-claim mechanism, confirmed by the symmetric pattern):
+
+    - Channel i=1 (first non-reference) runs first. Its spatial query
+      covers PreBBoxes[1] expanded by margin (5-50 mm via ComputeMargin).
+      When channel-2's pre-script bbox+margin overlaps channel-1's, the
+      iterator returns SOME of channel-2's tracks alongside channel-1's
+      own. DoneSet marks them transformed at theta_1 = 360/N.
+    - When channel i=2 runs, its spatial query finds only the tracks NOT
+      already in DoneSet. Channel i=2 ends up with a MIX of theta_1-
+      rotated tracks (stolen by i=1) and theta_2-rotated tracks (kept
+      for itself). Visible result: channel i=1 looks perfect; channels
+      i=2..N-1 have correctly-placed components but tracks at mixed
+      rotations.
+
+  Fix: re-add three helpers from v14-1st verbatim:
+    1. PrimitiveCentroidXY  -- centroid math for any free primitive.
+    2. IsPrimitiveOwnedBy   -- OwnerMap lookup gate.
+    3. BuildPrimitiveOwnership -- one-time pre-pass assigning each free
+       primitive to its NEAREST pre-script channel centre (Euclidean
+       distance in mm to avoid TCoord^2 overflow), validated against
+       that channel's bbox+margin. Stores 'PrimitiveKey=chanIdx' per
+       primitive in OwnerMap. Primitives outside any channel's bbox+
+       margin have no owner and are left alone by the polar loop.
+
+  TransformChannelFreePrimitives now takes (OwnerMap, chanIdx) and gates
+  every case branch on IsPrimitiveOwnedBy(key, chanIdx) before adding to
+  DoneSet. The bbox/margin filter stays as a cheap pre-check; OwnerMap is
+  the precise filter. OwnerMap is built BEFORE the reset step (same as
+  v14-1st) -- it has to see pre-script positions because that's when
+  tracks align with their owning channel's pre-script bbox.
+
+  Geometric formula in TransformChannelFreePrimitives is unchanged:
+    P_final = newC + R_theta(P - preC)
+  Math was verified correct in v15 by independent critique (the worked
+  example for N=14, refC=(0,-100), polarO=(0,0), channel B at (-50,-100)
+  with track at (-50,-80) yields v15 prediction matching the correct
+  rigid-body destination to within 0.01 mm). v16 changes nothing about
+  the math, only the attribution of "which channel owns which primitive."
+
+  Known limitations of nearest-centre ownership (carried over from v14-1st):
+    - If a channel's primitives happen to sit closer to a NEIGHBOUR's
+      pre-script centre than to their own, ownership goes to the
+      neighbour. The PointInRect-against-neighbour-bbox+margin
+      validation may pass (-> primitive moves with the neighbour, wrong
+      visually) or fail (-> primitive has no owner and stays put,
+      orphan). For layouts where channels are radially symmetric around
+      a central feeder this is rare; for arbitrary user-placed pre-
+      script layouts it can happen. Manifests as a small number of
+      stragglers, not a wholesale rotation error.
 
   ================================================================
   WHAT CHANGED IN v15.2
@@ -478,9 +542,93 @@ begin
   Board.BoardIterator_Destroy(Iter);
 end;
 
+{ ---------------------------------------------------------------------------
+  PrimitiveCentroidXY
+  Returns the (cx, cy) for a free primitive, or (0,0)+result=False if the
+  primitive's object kind isn't one we transform. Mirrors the centroid math
+  used inside TransformChannelFreePrimitives so the two stay in lockstep.
+  v16: restored from v14-1st (613d526) alongside the ownership-routing
+  layer; used by BuildPrimitiveOwnership to test which channel owns each
+  free primitive.
+--------------------------------------------------------------------------- }
+function PrimitiveCentroidXY(Prim : IPCB_Primitive;
+                             var cx, cy : TCoord) : Boolean;
+var
+  track : IPCB_Track;
+  via   : IPCB_Via;
+  arc   : IPCB_Arc;
+  txt   : IPCB_Text;
+  pad   : IPCB_Pad;
+begin
+  Result := True;
+  case Prim.ObjectId of
+    eTrackObject:
+    begin
+      track := Prim;
+      cx := (track.X1 + track.X2) div 2;
+      cy := (track.Y1 + track.Y2) div 2;
+    end;
+    eViaObject:
+    begin
+      via := Prim;
+      cx := via.X;
+      cy := via.Y;
+    end;
+    eArcObject:
+    begin
+      arc := Prim;
+      cx := arc.XCenter;
+      cy := arc.YCenter;
+    end;
+    eFillObject:
+    begin
+      cx := (Prim.X1Location + Prim.X2Location) div 2;
+      cy := (Prim.Y1Location + Prim.Y2Location) div 2;
+    end;
+    eTextObject:
+    begin
+      txt := Prim;
+      cx := txt.XLocation;
+      cy := txt.YLocation;
+    end;
+    ePadObject:
+    begin
+      pad := Prim;
+      cx := pad.X;
+      cy := pad.Y;
+    end;
+  else
+    begin
+      cx := 0;
+      cy := 0;
+      Result := False;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  IsPrimitiveOwnedBy
+  Returns True iff OwnerMap contains the exact entry 'key=chanIdx'.
+  Uses TStringList.IndexOf full-string match, which is binary-search when
+  OwnerMap.Sorted is True (same Sorted+IndexOf pattern as DoneSet below).
+
+  Implementation note: original draft used IndexOfName / ValueFromIndex
+  for cleaner code, but those are not in the verified TStringList API
+  surface for this Altium build. Full-string match is sufficient because
+  the caller already knows which chanIdx to ask about.
+--------------------------------------------------------------------------- }
+function IsPrimitiveOwnedBy(OwnerMap : TStringList;
+                            key      : String;
+                            chanIdx  : Integer) : Boolean;
+begin
+  Result := (OwnerMap.IndexOf(key + '=' + IntToStr(chanIdx)) >= 0);
+end;
+
 { --------------------------------------------------------------------------- }
-procedure TransformChannelFreePrimitives(Board   : IPCB_Board;
-                                         DoneSet : TStringList;
+procedure TransformChannelFreePrimitives(Board    : IPCB_Board;
+                                         DoneSet  : TStringList;
+                                         OwnerMap : TStringList;
+                                         chanIdx  : Integer;
                                          bx1, by1, bx2, by2 : TCoord;
                                          margin  : TCoord;
                                          oldCX, oldCY : TCoord;
@@ -523,7 +671,8 @@ begin
                        bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(track);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(track.X1, track.Y1, oldCX, oldCY, rotateDeg, tx,  ty);
@@ -544,7 +693,8 @@ begin
                        bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(via);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(via.X, via.Y, oldCX, oldCY, rotateDeg, tx, ty);
@@ -564,7 +714,8 @@ begin
                        bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(arc);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(arc.XCenter, arc.YCenter, oldCX, oldCY, rotateDeg, tx, ty);
@@ -591,7 +742,8 @@ begin
                          bx2 + margin, by2 + margin) then
           begin
             key := PrimitiveKey(Prim);
-            if DoneSet.IndexOf(key) < 0 then
+            if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
             begin
               DoneSet.Add(key);
               RotatePointXY(fillCX, fillCY, oldCX, oldCY, rotateDeg, tx, ty);
@@ -615,7 +767,8 @@ begin
                        bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(txt);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(txt.XLocation, txt.YLocation, oldCX, oldCY,
@@ -637,7 +790,8 @@ begin
                        bx2 + margin, by2 + margin) then
         begin
           key := PrimitiveKey(pad);
-          if DoneSet.IndexOf(key) < 0 then
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
           begin
             DoneSet.Add(key);
             RotatePointXY(pad.X, pad.Y, oldCX, oldCY, rotateDeg, tx, ty);
@@ -1304,6 +1458,108 @@ begin
   compCount := vals[6];
 end;
 
+{ ---------------------------------------------------------------------------
+  BuildPrimitiveOwnership
+  v16 (restored from v14-1st, 613d526): one-time pre-pass over every free
+  primitive on the board. For each, assign to the nearest pre-script
+  channel centre (Euclidean distance in mm to avoid TCoord^2 overflow:
+  TCoord is int32 nm, channel pitches of ~100 mm squared overflow 32-bit
+  signed). Then validate the primitive falls inside that channel's bbox+
+  margin -- if not, the primitive is a global feature (board outline
+  text, mounting-hole keep-out fills, etc.) and no channel owns it.
+
+  Result is stored as 'PrimitiveKey=chanIdx' lines in OwnerMap, looked up
+  later by TransformChannelFreePrimitives via IsPrimitiveOwnedBy.
+
+  Must run BEFORE the reset step -- only then are the channels at their
+  user-placed pre-script positions, where each channel's tracks really
+  do sit inside that channel's bbox.
+
+  PreBBoxes : the CSV snapshot built by SnapshotChannelBBoxes.
+  OwnerMap  : pre-allocated TStringList; cleared and refilled.
+
+  Limitations: nearest-centre attribution can misclassify a primitive
+  that sits closer to a NEIGHBOUR's pre-script centre than to its own
+  channel's centre. PointInRect-against-neighbour-bbox+margin may pass
+  (-> primitive moves with the neighbour, wrong visually) or fail (->
+  primitive has no owner, stays put as an orphan). For radially-
+  symmetric pre-script layouts both modes are rare; for arbitrary
+  user-placed layouts they show up as a small number of stragglers.
+--------------------------------------------------------------------------- }
+procedure BuildPrimitiveOwnership(Board     : IPCB_Board;
+                                  PreBBoxes : TStringList;
+                                  OwnerMap  : TStringList);
+var
+  Iter        : IPCB_BoardIterator;
+  Prim        : IPCB_Primitive;
+  primX, primY : TCoord;
+  i, bestI    : Integer;
+  preMinX, preMinY, preMaxX, preMaxY, preCX, preCY : TCoord;
+  preCount    : Integer;
+  dxm, dym, distSq, bestDistSq : Double;
+  bestMinX, bestMinY, bestMaxX, bestMaxY : TCoord;
+  margin      : TCoord;
+  key         : String;
+begin
+  OwnerMap.Clear;
+  OwnerMap.Sorted := True;
+  OwnerMap.Duplicates := dupIgnore;
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eTrackObject, eViaObject, eArcObject,
+                                  eFillObject, eTextObject, ePadObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Prim := Iter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    if (Prim.Component = Nil) and PrimitiveCentroidXY(Prim, primX, primY) then
+    begin
+      { Find the nearest channel centre. Distance squared in mm-Double
+        space to avoid TCoord^2 overflow. }
+      bestI := -1;
+      bestDistSq := 0;
+      bestMinX := 0; bestMinY := 0; bestMaxX := 0; bestMaxY := 0;
+      for i := 0 to PreBBoxes.Count - 1 do
+      begin
+        GetBBoxFromSnapshot(PreBBoxes, i,
+                            preMinX, preMinY, preMaxX, preMaxY,
+                            preCX, preCY, preCount);
+        if preCount > 0 then
+        begin
+          dxm := CoordToMMs(primX - preCX);
+          dym := CoordToMMs(primY - preCY);
+          distSq := (dxm * dxm) + (dym * dym);
+          if (bestI < 0) or (distSq < bestDistSq) then
+          begin
+            bestDistSq := distSq;
+            bestI := i;
+            bestMinX := preMinX; bestMinY := preMinY;
+            bestMaxX := preMaxX; bestMaxY := preMaxY;
+          end;
+        end;
+      end;
+
+      { Confirm the primitive is inside the winning channel's bbox+margin.
+        If not, it's a global primitive and no channel owns it. }
+      if bestI >= 0 then
+      begin
+        margin := ComputeMargin(bestMinX, bestMinY, bestMaxX, bestMaxY);
+        if PointInRect(primX, primY,
+                       bestMinX - margin, bestMinY - margin,
+                       bestMaxX + margin, bestMaxY + margin) then
+        begin
+          key := PrimitiveKey(Prim);
+          OwnerMap.Add(key + '=' + IntToStr(bestI));
+        end;
+      end;
+    end;
+    Prim := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+end;
+
 { ===========================================================================
   ENTRY POINT
 =========================================================================== }
@@ -1315,6 +1571,7 @@ var
   ChanNames      : TStringList;  { matching channel class names }
   DoneSet        : TStringList;
   PreBBoxes      : TStringList;  { pre-reset bbox snapshot per channel idx }
+  OwnerMap       : TStringList;  { v16: 'primKey=chanIdx' per free primitive }
 
   i, N, compCount, refIdx : Integer;
   prefix, inputStr, refClassName : String;
@@ -1549,6 +1806,17 @@ begin
   PreBBoxes := TStringList.Create;
   SnapshotChannelBBoxes(Board, ChanNames, PreBBoxes);
 
+  { ---- Step 7a-bis: Build per-primitive ownership map ----
+    v16: assign every free primitive on the board to its nearest pre-script
+    channel (validated by bbox+margin). Must run BEFORE the reset step,
+    while channels are still at their user-placed positions and free
+    primitives align with their owning channel's pre-script bbox. The
+    polar loop then uses OwnerMap to refuse cross-claims when adjacent
+    channels' bbox+margin regions overlap (the MotionJigBase 12-channel
+    starburst symptom). See v16 header changelog for full motivation. }
+  OwnerMap := TStringList.Create;
+  BuildPrimitiveOwnership(Board, PreBBoxes, OwnerMap);
+
   { ---- Step 7b: Apply reset ---- }
   PCBServer.PreProcess;
   resetMatched := ResetChannelsToMatchReference(Board, Cls, ChanNames[0], ChanNames);
@@ -1603,7 +1871,7 @@ begin
     if preCount > 0 then
     begin
       margin := ComputeMargin(preMinX, preMinY, preMaxX, preMaxY);
-      TransformChannelFreePrimitives(Board, DoneSet,
+      TransformChannelFreePrimitives(Board, DoneSet, OwnerMap, i,
                                       preMinX, preMinY, preMaxX, preMaxY, margin,
                                       preCX, preCY, newCX, newCY, rotateDeg);
     end;
@@ -1622,5 +1890,6 @@ begin
 
   DoneSet.Free;
   PreBBoxes.Free;
+  OwnerMap.Free;
   ChanNames.Free;
 end;
