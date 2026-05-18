@@ -89,6 +89,26 @@ begin
   oy   := cy + MMsToCoord(dx * sinA + dy * cosA);
 end;
 
+{ ---------------------------------------------------------------------------
+  D_Fmt -- format a TCoord value as a mm string with 4 decimal places.
+  Diagnostic output helper. Moved here from below 2026-05-18 to fix
+  forward-reference compile error: first call is line ~844, original
+  definition was at line ~900. DelphiScript on AD26 requires definition
+  before use.
+--------------------------------------------------------------------------- }
+function D_Fmt(c : TCoord) : String;
+begin
+  Result := FloatToStrF(CoordToMMs(c), ffFixed, 12, 4);
+end;
+
+{ ---------------------------------------------------------------------------
+  D_FmtDeg -- format a Double angle to 4 decimal places.
+--------------------------------------------------------------------------- }
+function D_FmtDeg(d : Double) : String;
+begin
+  Result := FloatToStrF(d, ffFixed, 10, 4);
+end;
+
 { --------------------------------------------------------------------------- }
 { pattern from PolarChannelArray.pas:273 -- PointInRect verbatim }
 function D_PointInRect(x, y, x1, y1, x2, y2 : TCoord) : Boolean;
@@ -894,21 +914,12 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  D_Fmt -- format a TCoord value as a mm string with 4 decimal places.
-  Diagnostic output helper.
+  D_Fmt + D_FmtDeg were here originally but were relocated to ~line 91
+  (immediately after D_RotatePointXY) on 2026-05-18 to fix a forward-
+  reference compile error. DelphiScript on AD26 needs the definition
+  before any use, and the first uses appear in routines defined ~50 lines
+  above this point.
 --------------------------------------------------------------------------- }
-function D_Fmt(c : TCoord) : String;
-begin
-  Result := FloatToStrF(CoordToMMs(c), ffFixed, 12, 4);
-end;
-
-{ ---------------------------------------------------------------------------
-  D_FmtDeg -- format a Double angle to 4 decimal places.
---------------------------------------------------------------------------- }
-function D_FmtDeg(d : Double) : String;
-begin
-  Result := FloatToStrF(d, ffFixed, 10, 4);
-end;
 
 { ---------------------------------------------------------------------------
   D_LayerName -- return a human-readable layer name for diagnostic output.
@@ -1224,38 +1235,50 @@ end;
 function D_ParseTrackCSV(csv : String;
                          var tX1, tY1, tX2, tY2 : TCoord) : Boolean;
 var
-  parts : TStringList;
-  p     : Integer;
-  tok   : String;
-  vals  : array[0..3] of Integer;
-  fi    : Integer;
-  rest  : String;
+  p    : Integer;
+  rest : String;
+  tok  : String;
 begin
+  { Rewritten 2026-05-18 — original used `vals : array[0..3] of Integer` as
+    an intermediate and a while-loop. Bench evidence: every track in every
+    channel reported "parse error" while the structurally-similar
+    D_ParseCompCSV (which uses direct TCoord assignment, no intermediate
+    array) worked fine. Suspected cause: AD26 DelphiScript handling of local
+    `array[0..3] of Integer` declared inside a function with a `var TCoord`
+    parameter — the indexed assignment silently fails OR `fi` increment is
+    aliased, so the loop exits before fi=4 and `if fi < 4 then Exit` fires.
+    Rewrite uses the same shape as D_ParseCompCSV: direct TCoord assignment,
+    no array. Same behaviour as a numeric parser, just unrolled. }
   Result := False;
   tX1 := 0; tY1 := 0; tX2 := 0; tY2 := 0;
-  fi := 0;
   rest := csv;
-  while (Length(rest) > 0) and (fi < 4) do
-  begin
-    p := Pos(',', rest);
-    if p = 0 then
-    begin
-      tok := rest;
-      rest := '';
-    end
-    else
-    begin
-      tok  := Copy(rest, 1, p - 1);
-      rest := Copy(rest, p + 1, Length(rest) - p);
-    end;
-    vals[fi] := StrToIntDef(Trim(tok), 0);
-    fi := fi + 1;
-  end;
-  if fi < 4 then Exit;
-  tX1 := vals[0];
-  tY1 := vals[1];
-  tX2 := vals[2];
-  tY2 := vals[3];
+
+  { X1 }
+  p := Pos(',', rest);
+  if p = 0 then Exit;
+  tok  := Copy(rest, 1, p - 1);
+  rest := Copy(rest, p + 1, Length(rest) - p);
+  tX1 := StrToIntDef(Trim(tok), 0);
+
+  { Y1 }
+  p := Pos(',', rest);
+  if p = 0 then Exit;
+  tok  := Copy(rest, 1, p - 1);
+  rest := Copy(rest, p + 1, Length(rest) - p);
+  tY1 := StrToIntDef(Trim(tok), 0);
+
+  { X2 }
+  p := Pos(',', rest);
+  if p = 0 then Exit;
+  tok  := Copy(rest, 1, p - 1);
+  rest := Copy(rest, p + 1, Length(rest) - p);
+  tX2 := StrToIntDef(Trim(tok), 0);
+
+  { Y2 — last field, no trailing comma }
+  tok := Trim(rest);
+  if Length(tok) = 0 then Exit;
+  tY2 := StrToIntDef(tok, 0);
+
   Result := True;
 end;
 
