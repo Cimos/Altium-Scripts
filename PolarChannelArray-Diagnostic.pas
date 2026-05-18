@@ -656,6 +656,244 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  D_PrimitiveCentroidXY -- returns the (cx, cy) centroid for any free
+  primitive we might rotate. Mirrors PrimitiveCentroidXY from
+  PolarChannelArray.pas v16. Returns False if the primitive's ObjectId
+  is not one we transform (caller skips it).
+--------------------------------------------------------------------------- }
+function D_PrimitiveCentroidXY(Prim : IPCB_Primitive;
+                               var cx, cy : TCoord) : Boolean;
+var
+  track : IPCB_Track;
+  via   : IPCB_Via;
+  arc   : IPCB_Arc;
+  txt   : IPCB_Text;
+  pad   : IPCB_Pad;
+begin
+  Result := True;
+  case Prim.ObjectId of
+    eTrackObject:
+    begin
+      track := Prim;
+      cx := (track.X1 + track.X2) div 2;
+      cy := (track.Y1 + track.Y2) div 2;
+    end;
+    eViaObject:
+    begin
+      via := Prim;
+      cx := via.X;
+      cy := via.Y;
+    end;
+    eArcObject:
+    begin
+      arc := Prim;
+      cx := arc.XCenter;
+      cy := arc.YCenter;
+    end;
+    eFillObject:
+    begin
+      cx := (Prim.X1Location + Prim.X2Location) div 2;
+      cy := (Prim.Y1Location + Prim.Y2Location) div 2;
+    end;
+    eTextObject:
+    begin
+      txt := Prim;
+      cx := txt.XLocation;
+      cy := txt.YLocation;
+    end;
+    ePadObject:
+    begin
+      pad := Prim;
+      cx := pad.X;
+      cy := pad.Y;
+    end;
+  else
+    begin
+      cx := 0;
+      cy := 0;
+      Result := False;
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  D_DumpOwnershipStage -- dry-run of BuildPrimitiveOwnership from v16
+  PolarChannelArray.pas. For each free primitive on the board, computes
+  the nearest pre-script channel centre (Euclidean in mm), then validates
+  the primitive is inside that channel's bbox+margin. Outputs:
+
+    - Per-channel owned count.
+    - Unowned count (passed nearest-centre, failed validation).
+    - Sample of MAX_OWNERSHIP_SAMPLES per-primitive decisions: which
+      channel won, distances to each channel, validation pass/fail.
+
+  Does NOT modify the board. Reads the same OwnerMap semantics that the
+  real script's BuildPrimitiveOwnership applies.
+
+  Disambiguates the 2026-05-15 v16-tracks-still-misaligned hypothesis set:
+    A) most primitives owned by chanIdx 0 (reference, skipped by polar
+       loop) -> co-located pre-script channels confuse nearest-centre;
+       fix needs net-based attribution.
+    B) most primitives unowned (rejected by bbox+margin validation) ->
+       loosen the validation step OR widen margin.
+    C) ownership distribution looks correct -> issue is elsewhere
+       (BeginModify gap, transform formula, accumulated state).
+--------------------------------------------------------------------------- }
+procedure D_DumpOwnershipStage(Board     : IPCB_Board;
+                               Lines     : TStringList;
+                               ChanNames : TStringList;
+                               PreBBoxes : TStringList;
+                               MaxSamples : Integer);
+var
+  Iter : IPCB_BoardIterator;
+  Prim : IPCB_Primitive;
+  primX, primY : TCoord;
+  i, bestI, total, ownedSampled, unowned : Integer;
+  N : Integer;
+  preMinX, preMinY, preMaxX, preMaxY, preCX, preCY : TCoord;
+  preCount : Integer;
+  dxm, dym, distSq, bestDistSq : Double;
+  bestMinX, bestMinY, bestMaxX, bestMaxY : TCoord;
+  margin : TCoord;
+  key : String;
+  ownerCount : array[0..255] of Integer;
+  validated : Boolean;
+  distances : String;
+begin
+  N := ChanNames.Count;
+  if N > 256 then N := 256;
+  for i := 0 to N - 1 do ownerCount[i] := 0;
+  total := 0;
+  ownedSampled := 0;
+  unowned := 0;
+
+  Lines.Add('[OWNERSHIP STAGE]');
+  Lines.Add('  Dry-run of v16 BuildPrimitiveOwnership against the current board.');
+  Lines.Add('  Does NOT modify the board. Identifies which channel each free');
+  Lines.Add('  primitive WOULD be assigned to in a real run.');
+  Lines.Add('');
+  Lines.Add('  Polar loop SKIPS chanIdx 0 (reference). Primitives owned by');
+  Lines.Add('  chanIdx 0 WILL NOT MOVE in a real run, even if owned cleanly.');
+  Lines.Add('');
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eTrackObject, eViaObject, eArcObject,
+                                  eFillObject, eTextObject, ePadObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Prim := Iter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    if (Prim.Component = Nil) and D_PrimitiveCentroidXY(Prim, primX, primY) then
+    begin
+      total := total + 1;
+
+      bestI := -1;
+      bestDistSq := 0;
+      bestMinX := 0; bestMinY := 0; bestMaxX := 0; bestMaxY := 0;
+      distances := '';
+
+      for i := 0 to N - 1 do
+      begin
+        D_GetBBoxFromSnapshot(PreBBoxes, i,
+                              preMinX, preMinY, preMaxX, preMaxY,
+                              preCX, preCY, preCount);
+        if preCount > 0 then
+        begin
+          dxm := CoordToMMs(primX - preCX);
+          dym := CoordToMMs(primY - preCY);
+          distSq := (dxm * dxm) + (dym * dym);
+
+          if ownedSampled < MaxSamples then
+          begin
+            if Length(distances) > 0 then distances := distances + ', ';
+            distances := distances + 'ch' + IntToStr(i) + '=' +
+                         FloatToStrF(Sqrt(distSq), ffFixed, 8, 2);
+          end;
+
+          if (bestI < 0) or (distSq < bestDistSq) then
+          begin
+            bestDistSq := distSq;
+            bestI := i;
+            bestMinX := preMinX; bestMinY := preMinY;
+            bestMaxX := preMaxX; bestMaxY := preMaxY;
+          end;
+        end;
+      end;
+
+      validated := False;
+      if bestI >= 0 then
+      begin
+        margin := D_ComputeMargin(bestMinX, bestMinY, bestMaxX, bestMaxY);
+        validated := D_PointInRect(primX, primY,
+                                   bestMinX - margin, bestMinY - margin,
+                                   bestMaxX + margin, bestMaxY + margin);
+      end;
+
+      if validated and (bestI >= 0) and (bestI < N) then
+        ownerCount[bestI] := ownerCount[bestI] + 1
+      else
+        unowned := unowned + 1;
+
+      if ownedSampled < MaxSamples then
+      begin
+        ownedSampled := ownedSampled + 1;
+        key := D_PrimitiveKey(Prim);
+        Lines.Add('  primitive[' + IntToStr(ownedSampled) + ']  key=' + key);
+        Lines.Add('    centroid_mm  = (' + D_Fmt(primX) + ', ' + D_Fmt(primY) + ')');
+        Lines.Add('    distances_mm : ' + distances);
+        if validated then
+          Lines.Add('    decision     = OWNED by chanIdx ' + IntToStr(bestI) +
+                    ' (' + ChanNames[bestI] + ')')
+        else if bestI >= 0 then
+          Lines.Add('    decision     = nearest is chanIdx ' + IntToStr(bestI) +
+                    ' (' + ChanNames[bestI] + ') BUT centroid outside its bbox+margin -> UNOWNED')
+        else
+          Lines.Add('    decision     = no channel has components (UNOWNED)');
+        Lines.Add('');
+      end;
+    end;
+    Prim := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+
+  Lines.Add('  -- Ownership summary --');
+  Lines.Add('  total free primitives examined: ' + IntToStr(total));
+  for i := 0 to N - 1 do
+  begin
+    distances := '';
+    if total > 0 then
+    begin
+      dxm := (ownerCount[i] * 100.0) / total;
+      if (i = 0) and (dxm > 60.0) then
+        distances := '  [WARN: reference owns ' +
+                     FloatToStrF(dxm, ffFixed, 6, 1) +
+                     '% -> hypothesis C likely]'
+      else if ownerCount[i] = 0 then
+        distances := '  [no primitives -> channel has nothing to move]';
+    end;
+    Lines.Add('    chanIdx ' + IntToStr(i) + ' (' + ChanNames[i] + ')  owned=' +
+              IntToStr(ownerCount[i]) + distances);
+  end;
+  Lines.Add('    UNOWNED (failed bbox+margin validation) = ' + IntToStr(unowned));
+  Lines.Add('');
+  Lines.Add('  Interpretation:');
+  Lines.Add('    - If chanIdx 0 owns most primitives -> HYPOTHESIS C confirmed');
+  Lines.Add('      (co-located pre-script channels; nearest-centre defaults');
+  Lines.Add('      everything to the reference). Polar loop will skip those');
+  Lines.Add('      primitives. Fix: net-based attribution or require user to');
+  Lines.Add('      spread channels out pre-script.');
+  Lines.Add('    - If UNOWNED count is high -> HYPOTHESIS B (validation too');
+  Lines.Add('      strict). Loosen the bbox+margin check OR widen margin.');
+  Lines.Add('    - If ownership looks balanced across non-zero channels but');
+  Lines.Add('      tracks still misalign on a real run -> HYPOTHESIS A');
+  Lines.Add('      (state poisoned by a prior v17 run) OR an issue downstream');
+  Lines.Add('      of ownership (BeginModify gap, transform formula).');
+  Lines.Add('');
+end;
+
+{ ---------------------------------------------------------------------------
   D_Fmt -- format a TCoord value as a mm string with 4 decimal places.
   Diagnostic output helper.
 --------------------------------------------------------------------------- }
@@ -1445,6 +1683,9 @@ begin
 
     Lines.Add('');
   end;
+
+  { ---- Section: ownership stage (dry-run of v16 BuildPrimitiveOwnership) ---- }
+  D_DumpOwnershipStage(Board, Lines, ChanNames, PreBBoxes, MAX_SAMPLE_PRIMS);
 
   { ---- Section: polar transform plan ---- }
   Lines.Add('[PLAN]');
