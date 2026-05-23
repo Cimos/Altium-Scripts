@@ -670,6 +670,7 @@ procedure TransformChannelFreePrimitives(Board    : IPCB_Board;
                                          rotateDeg    : Double);
 var
   Iter : IPCB_SpatialIterator;
+  PolyIter : IPCB_BoardIterator;
   Prim : IPCB_Primitive;
   dX, dY : TCoord;
   tx, ty, tx2, ty2 : TCoord;
@@ -841,62 +842,69 @@ begin
         end;
       end;
 
-      ePolyObject:
-      begin
-        { 2026-05-23: polygon-mover. Bench-confirmed API per
-          [[feedback-altium-polygon-api-ad26]]. Channel-specific
-          polygons (typically fan-shaped sectors on copper layers)
-          rotate around oldCXY then translate by (dX, dY) the same
-          way as other primitives.
-
-          For each segment:
-            - Rotate vx, vy (segment start vertex).
-            - For arc segments (Kind=1): also rotate cx, cy (arc center).
-          Then write the modified TPolySegment back via Segments[i] := seg.
-
-          User-side step: after the script completes, run
-          Tools > Polygon Pours > Repour All to regenerate the fills
-          at the new outline positions (already in the script's final
-          ShowMessage at line 1888). }
-        poly := Prim;
-        polyBBCX := (poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2;
-        polyBBCY := (poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2;
-        if (poly.Component = Nil) and
-           PointInRect(polyBBCX, polyBBCY,
-                       bx1 - margin, by1 - margin,
-                       bx2 + margin, by2 + margin) then
-        begin
-          key := PrimitiveKey(poly);
-          if (DoneSet.IndexOf(key) < 0) and
-             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
-          begin
-            DoneSet.Add(key);
-            pointCount := poly.PointCount;
-            for polyIdx := 0 to pointCount - 1 do
-            begin
-              seg := poly.Segments[polyIdx];
-              RotatePointXY(seg.vx, seg.vy, oldCX, oldCY, rotateDeg, tx, ty);
-              seg.vx := tx + dX;
-              seg.vy := ty + dY;
-              if seg.Kind = 1 then  { arc segment -- transform the arc center too }
-              begin
-                RotatePointXY(seg.cx, seg.cy, oldCX, oldCY, rotateDeg, tx, ty);
-                seg.cx := tx + dX;
-                seg.cy := ty + dY;
-              end;
-              poly.Segments[polyIdx] := seg;
-            end;
-            poly.GraphicallyInvalidate;
-          end;
-        end;
-      end;
-
     end; { case }
 
     Prim := Iter.NextPCBObject;
   end; { while }
 
   Board.SpatialIterator_Destroy(Iter);
+
+  { ---- Polygon pass (added 2026-05-23) ----
+    Bench-observed 2026-05-23: putting ePolyObject in the SpatialIterator
+    case statement did NOT move polygons. Suspect SpatialIterator's
+    bbox-based query does not enumerate polygons reliably (probably
+    treats them as their fill primitives rather than the outline
+    object). Switch to BoardIterator with explicit ObjectSet -- same
+    pattern that BuildPrimitiveOwnership uses (and that pass DOES
+    return polygons cleanly, verified by probe-1).
+
+    DoneSet still protects against any double-move (if Altium ever
+    returned a polygon from BOTH iterators, the second visit skips). }
+  PolyIter := Board.BoardIterator_Create;
+  PolyIter.AddFilter_ObjectSet(MkSet(ePolyObject));
+  PolyIter.AddFilter_LayerSet(AllLayers);
+  PolyIter.AddFilter_Method(eProcessAll);
+
+  Prim := PolyIter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    if Prim.ObjectId = ePolyObject then
+    begin
+      poly := Prim;
+      polyBBCX := (poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2;
+      polyBBCY := (poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2;
+      if (poly.Component = Nil) and
+         PointInRect(polyBBCX, polyBBCY,
+                     bx1 - margin, by1 - margin,
+                     bx2 + margin, by2 + margin) then
+      begin
+        key := PrimitiveKey(poly);
+        if (DoneSet.IndexOf(key) < 0) and
+           IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
+        begin
+          DoneSet.Add(key);
+          pointCount := poly.PointCount;
+          for polyIdx := 0 to pointCount - 1 do
+          begin
+            seg := poly.Segments[polyIdx];
+            RotatePointXY(seg.vx, seg.vy, oldCX, oldCY, rotateDeg, tx, ty);
+            seg.vx := tx + dX;
+            seg.vy := ty + dY;
+            if seg.Kind = 1 then  { arc segment -- transform the arc center too }
+            begin
+              RotatePointXY(seg.cx, seg.cy, oldCX, oldCY, rotateDeg, tx, ty);
+              seg.cx := tx + dX;
+              seg.cy := ty + dY;
+            end;
+            poly.Segments[polyIdx] := seg;
+          end;
+          poly.GraphicallyInvalidate;
+        end;
+      end;
+    end;
+    Prim := PolyIter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(PolyIter);
 end;
 
 { --------------------------------------------------------------------------- }
