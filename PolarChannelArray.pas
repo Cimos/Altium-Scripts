@@ -381,6 +381,16 @@ begin
     ePadObject:
       Result := 'P:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X) + ',' + IntToStr(Prim.Y);
+    ePolyObject:
+      { 2026-05-23: polygon key. Layer + bbox center + bbox dimensions.
+        See [[feedback-altium-polygon-api-ad26]] -- Poly.PointCount
+        accessible but adding it here for extra collision resistance
+        per the arc-key lesson at [[project-polar-array-arc-orphan-root-cause]]. }
+      Result := 'PG:' + IntToStr(Prim.Layer) + ',' +
+                IntToStr((Prim.BoundingRectangle.Left + Prim.BoundingRectangle.Right) div 2) + ',' +
+                IntToStr((Prim.BoundingRectangle.Bottom + Prim.BoundingRectangle.Top) div 2) + ',' +
+                IntToStr(Prim.BoundingRectangle.Right - Prim.BoundingRectangle.Left) + ',' +
+                IntToStr(Prim.BoundingRectangle.Top - Prim.BoundingRectangle.Bottom);
   end;
 end;
 
@@ -614,6 +624,13 @@ begin
       cx := pad.X;
       cy := pad.Y;
     end;
+    ePolyObject:
+    begin
+      { 2026-05-23: polygon centroid = bbox center. Verified accessor
+        per [[feedback-altium-polygon-api-ad26]]. }
+      cx := (Prim.BoundingRectangle.Left + Prim.BoundingRectangle.Right) div 2;
+      cy := (Prim.BoundingRectangle.Bottom + Prim.BoundingRectangle.Top) div 2;
+    end;
   else
     begin
       cx := 0;
@@ -664,6 +681,10 @@ var
   arc   : IPCB_Arc;
   txt   : IPCB_Text;
   pad   : IPCB_Pad;
+  poly  : IPCB_Polygon;
+  seg   : TPolySegment;
+  polyBBCX, polyBBCY : TCoord;
+  pointCount, polyIdx : Integer;
 begin
   dX := newCX - oldCX;
   dY := newCY - oldCY;
@@ -816,6 +837,56 @@ begin
             pad.Y := ty + dY;
             pad.Rotation := NormaliseAngle(pad.Rotation + rotateDeg);
             pad.GraphicallyInvalidate;
+          end;
+        end;
+      end;
+
+      ePolyObject:
+      begin
+        { 2026-05-23: polygon-mover. Bench-confirmed API per
+          [[feedback-altium-polygon-api-ad26]]. Channel-specific
+          polygons (typically fan-shaped sectors on copper layers)
+          rotate around oldCXY then translate by (dX, dY) the same
+          way as other primitives.
+
+          For each segment:
+            - Rotate vx, vy (segment start vertex).
+            - For arc segments (Kind=1): also rotate cx, cy (arc center).
+          Then write the modified TPolySegment back via Segments[i] := seg.
+
+          User-side step: after the script completes, run
+          Tools > Polygon Pours > Repour All to regenerate the fills
+          at the new outline positions (already in the script's final
+          ShowMessage at line 1888). }
+        poly := Prim;
+        polyBBCX := (poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2;
+        polyBBCY := (poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2;
+        if (poly.Component = Nil) and
+           PointInRect(polyBBCX, polyBBCY,
+                       bx1 - margin, by1 - margin,
+                       bx2 + margin, by2 + margin) then
+        begin
+          key := PrimitiveKey(poly);
+          if (DoneSet.IndexOf(key) < 0) and
+             IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
+          begin
+            DoneSet.Add(key);
+            pointCount := poly.PointCount;
+            for polyIdx := 0 to pointCount - 1 do
+            begin
+              seg := poly.Segments[polyIdx];
+              RotatePointXY(seg.vx, seg.vy, oldCX, oldCY, rotateDeg, tx, ty);
+              seg.vx := tx + dX;
+              seg.vy := ty + dY;
+              if seg.Kind = 1 then  { arc segment -- transform the arc center too }
+              begin
+                RotatePointXY(seg.cx, seg.cy, oldCX, oldCY, rotateDeg, tx, ty);
+                seg.cx := tx + dX;
+                seg.cy := ty + dY;
+              end;
+              poly.Segments[polyIdx] := seg;
+            end;
+            poly.GraphicallyInvalidate;
           end;
         end;
       end;
@@ -1524,7 +1595,8 @@ begin
 
   Iter := Board.BoardIterator_Create;
   Iter.AddFilter_ObjectSet(MkSet(eTrackObject, eViaObject, eArcObject,
-                                  eFillObject, eTextObject, ePadObject));
+                                  eFillObject, eTextObject, ePadObject,
+                                  ePolyObject));
   Iter.AddFilter_LayerSet(AllLayers);
   Iter.AddFilter_Method(eProcessAll);
 
