@@ -686,6 +686,7 @@ var
   seg   : TPolySegment;
   polyBBCX, polyBBCY : TCoord;
   pointCount, polyIdx : Integer;
+  PolyLog : TStringList;
 begin
   dX := newCX - oldCX;
   dY := newCY - oldCY;
@@ -860,6 +861,29 @@ begin
 
     DoneSet still protects against any double-move (if Altium ever
     returned a polygon from BOTH iterators, the second visit skips). }
+  { Per-call diagnostic log (instrument added 2026-05-23 because the
+    polygon-mover produced visually-wrong results despite the math
+    checking out on paper). Appends to a board-wide log file so the
+    next bench run shows EVERY polygon-move attempt: pre-bbox,
+    chanIdx, rotateDeg, pivot, dX/dY, ownership-attribution result,
+    post-bbox. Remove after diagnosing. }
+  PolyLog := TStringList.Create;
+  if chanIdx > 1 then
+  begin
+    try
+      PolyLog.LoadFromFile('C:\Users\Public\polygon-move.log');
+    except
+    end;
+  end;
+  PolyLog.Add('--- chanIdx=' + IntToStr(chanIdx) +
+              '  rotateDeg=' + FloatToStrF(rotateDeg, ffFixed, 10, 3) +
+              '  oldC=(' + FloatToStrF(CoordToMMs(oldCX), ffFixed, 10, 3) +
+              ',' + FloatToStrF(CoordToMMs(oldCY), ffFixed, 10, 3) + ')' +
+              '  newC=(' + FloatToStrF(CoordToMMs(newCX), ffFixed, 10, 3) +
+              ',' + FloatToStrF(CoordToMMs(newCY), ffFixed, 10, 3) + ')' +
+              '  dXY=(' + FloatToStrF(CoordToMMs(dX), ffFixed, 10, 3) +
+              ',' + FloatToStrF(CoordToMMs(dY), ffFixed, 10, 3) + ')');
+
   PolyIter := Board.BoardIterator_Create;
   PolyIter.AddFilter_ObjectSet(MkSet(ePolyObject));
   PolyIter.AddFilter_LayerSet(AllLayers);
@@ -873,6 +897,13 @@ begin
       poly := Prim;
       polyBBCX := (poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2;
       polyBBCY := (poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2;
+
+      { Log every polygon visited, regardless of ownership decision. }
+      PolyLog.Add('  POLY layer=' + IntToStr(poly.Layer) +
+                  '  preBBoxC=(' + FloatToStrF(CoordToMMs(polyBBCX), ffFixed, 10, 3) +
+                  ',' + FloatToStrF(CoordToMMs(polyBBCY), ffFixed, 10, 3) + ')' +
+                  '  PointCount=' + IntToStr(poly.PointCount));
+
       if (poly.Component = Nil) and
          PointInRect(polyBBCX, polyBBCY,
                      bx1 - margin, by1 - margin,
@@ -883,10 +914,17 @@ begin
            IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
         begin
           DoneSet.Add(key);
+          PolyLog.Add('    -> OWNED+TRANSFORMING  key=' + key);
           pointCount := poly.PointCount;
           for polyIdx := 0 to pointCount - 1 do
           begin
             seg := poly.Segments[polyIdx];
+            PolyLog.Add('    pre  S[' + IntToStr(polyIdx) + ']' +
+                        '  Kind=' + IntToStr(seg.Kind) +
+                        '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
+                        '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3) +
+                        '  cx=' + FloatToStrF(CoordToMMs(seg.cx), ffFixed, 10, 3) +
+                        '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3));
             RotatePointXY(seg.vx, seg.vy, oldCX, oldCY, rotateDeg, tx, ty);
             seg.vx := tx + dX;
             seg.vy := ty + dY;
@@ -897,14 +935,33 @@ begin
               seg.cy := ty + dY;
             end;
             poly.Segments[polyIdx] := seg;
+            PolyLog.Add('    post S[' + IntToStr(polyIdx) + ']' +
+                        '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
+                        '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3) +
+                        '  cx=' + FloatToStrF(CoordToMMs(seg.cx), ffFixed, 10, 3) +
+                        '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3));
           end;
           poly.GraphicallyInvalidate;
-        end;
-      end;
+          PolyLog.Add('    postBBoxC=(' +
+                      FloatToStrF(CoordToMMs((poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2), ffFixed, 10, 3) +
+                      ',' +
+                      FloatToStrF(CoordToMMs((poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2), ffFixed, 10, 3) + ')');
+        end
+        else
+          PolyLog.Add('    -> SKIP (DoneSet hit OR not owned by ch' + IntToStr(chanIdx) + ')');
+      end
+      else
+        PolyLog.Add('    -> SKIP (Component<>Nil OR bbox-center outside ch' + IntToStr(chanIdx) + ' area)');
     end;
     Prim := PolyIter.NextPCBObject;
   end;
   Board.BoardIterator_Destroy(PolyIter);
+
+  try
+    PolyLog.SaveToFile('C:\Users\Public\polygon-move.log');
+  except
+  end;
+  PolyLog.Free;
 end;
 
 { --------------------------------------------------------------------------- }
