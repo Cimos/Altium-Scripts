@@ -935,11 +935,16 @@ begin
               seg.cy := ty + dY;
             end;
             poly.Segments[polyIdx] := seg;
+            { READ BACK to verify the write persisted. If readback shows
+              different values from what we wrote, Segments[i] := seg is
+              a silent no-op (the compile-test only verified syntax). }
+            seg := poly.Segments[polyIdx];
             PolyLog.Add('    post S[' + IntToStr(polyIdx) + ']' +
                         '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
                         '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3) +
                         '  cx=' + FloatToStrF(CoordToMMs(seg.cx), ffFixed, 10, 3) +
-                        '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3));
+                        '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3) +
+                        '  (READ-BACK)');
           end;
           poly.GraphicallyInvalidate;
           PolyLog.Add('    postBBoxC=(' +
