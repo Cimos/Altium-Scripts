@@ -381,16 +381,6 @@ begin
     ePadObject:
       Result := 'P:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X) + ',' + IntToStr(Prim.Y);
-    ePolyObject:
-      { 2026-05-23: polygon key. Layer + bbox center + bbox dimensions.
-        See [[feedback-altium-polygon-api-ad26]] -- Poly.PointCount
-        accessible but adding it here for extra collision resistance
-        per the arc-key lesson at [[project-polar-array-arc-orphan-root-cause]]. }
-      Result := 'PG:' + IntToStr(Prim.Layer) + ',' +
-                IntToStr((Prim.BoundingRectangle.Left + Prim.BoundingRectangle.Right) div 2) + ',' +
-                IntToStr((Prim.BoundingRectangle.Bottom + Prim.BoundingRectangle.Top) div 2) + ',' +
-                IntToStr(Prim.BoundingRectangle.Right - Prim.BoundingRectangle.Left) + ',' +
-                IntToStr(Prim.BoundingRectangle.Top - Prim.BoundingRectangle.Bottom);
   end;
 end;
 
@@ -624,13 +614,6 @@ begin
       cx := pad.X;
       cy := pad.Y;
     end;
-    ePolyObject:
-    begin
-      { 2026-05-23: polygon centroid = bbox center. Verified accessor
-        per [[feedback-altium-polygon-api-ad26]]. }
-      cx := (Prim.BoundingRectangle.Left + Prim.BoundingRectangle.Right) div 2;
-      cy := (Prim.BoundingRectangle.Bottom + Prim.BoundingRectangle.Top) div 2;
-    end;
   else
     begin
       cx := 0;
@@ -670,7 +653,6 @@ procedure TransformChannelFreePrimitives(Board    : IPCB_Board;
                                          rotateDeg    : Double);
 var
   Iter : IPCB_SpatialIterator;
-  PolyIter : IPCB_BoardIterator;
   Prim : IPCB_Primitive;
   dX, dY : TCoord;
   tx, ty, tx2, ty2 : TCoord;
@@ -682,11 +664,6 @@ var
   arc   : IPCB_Arc;
   txt   : IPCB_Text;
   pad   : IPCB_Pad;
-  poly  : IPCB_Polygon;
-  seg   : TPolySegment;
-  polyBBCX, polyBBCY : TCoord;
-  pointCount, polyIdx : Integer;
-  PolyLog : TStringList;
 begin
   dX := newCX - oldCX;
   dY := newCY - oldCY;
@@ -849,131 +826,6 @@ begin
   end; { while }
 
   Board.SpatialIterator_Destroy(Iter);
-
-  { ---- Polygon pass (added 2026-05-23) ----
-    Bench-observed 2026-05-23: putting ePolyObject in the SpatialIterator
-    case statement did NOT move polygons. Suspect SpatialIterator's
-    bbox-based query does not enumerate polygons reliably (probably
-    treats them as their fill primitives rather than the outline
-    object). Switch to BoardIterator with explicit ObjectSet -- same
-    pattern that BuildPrimitiveOwnership uses (and that pass DOES
-    return polygons cleanly, verified by probe-1).
-
-    DoneSet still protects against any double-move (if Altium ever
-    returned a polygon from BOTH iterators, the second visit skips). }
-  { Per-call diagnostic log (instrument added 2026-05-23 because the
-    polygon-mover produced visually-wrong results despite the math
-    checking out on paper). Appends to a board-wide log file so the
-    next bench run shows EVERY polygon-move attempt: pre-bbox,
-    chanIdx, rotateDeg, pivot, dX/dY, ownership-attribution result,
-    post-bbox. Remove after diagnosing. }
-  PolyLog := TStringList.Create;
-  if chanIdx > 1 then
-  begin
-    try
-      PolyLog.LoadFromFile('C:\Users\Public\polygon-move.log');
-    except
-    end;
-  end;
-  PolyLog.Add('--- chanIdx=' + IntToStr(chanIdx) +
-              '  rotateDeg=' + FloatToStrF(rotateDeg, ffFixed, 10, 3) +
-              '  oldC=(' + FloatToStrF(CoordToMMs(oldCX), ffFixed, 10, 3) +
-              ',' + FloatToStrF(CoordToMMs(oldCY), ffFixed, 10, 3) + ')' +
-              '  newC=(' + FloatToStrF(CoordToMMs(newCX), ffFixed, 10, 3) +
-              ',' + FloatToStrF(CoordToMMs(newCY), ffFixed, 10, 3) + ')' +
-              '  dXY=(' + FloatToStrF(CoordToMMs(dX), ffFixed, 10, 3) +
-              ',' + FloatToStrF(CoordToMMs(dY), ffFixed, 10, 3) + ')');
-
-  PolyIter := Board.BoardIterator_Create;
-  PolyIter.AddFilter_ObjectSet(MkSet(ePolyObject));
-  PolyIter.AddFilter_LayerSet(AllLayers);
-  PolyIter.AddFilter_Method(eProcessAll);
-
-  Prim := PolyIter.FirstPCBObject;
-  while Prim <> Nil do
-  begin
-    if Prim.ObjectId = ePolyObject then
-    begin
-      poly := Prim;
-      polyBBCX := (poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2;
-      polyBBCY := (poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2;
-
-      { Log every polygon visited, regardless of ownership decision. }
-      PolyLog.Add('  POLY layer=' + IntToStr(poly.Layer) +
-                  '  preBBoxC=(' + FloatToStrF(CoordToMMs(polyBBCX), ffFixed, 10, 3) +
-                  ',' + FloatToStrF(CoordToMMs(polyBBCY), ffFixed, 10, 3) + ')' +
-                  '  PointCount=' + IntToStr(poly.PointCount));
-
-      if (poly.Component = Nil) and
-         PointInRect(polyBBCX, polyBBCY,
-                     bx1 - margin, by1 - margin,
-                     bx2 + margin, by2 + margin) then
-      begin
-        key := PrimitiveKey(poly);
-        if (DoneSet.IndexOf(key) < 0) and
-           IsPrimitiveOwnedBy(OwnerMap, key, chanIdx) then
-        begin
-          DoneSet.Add(key);
-          PolyLog.Add('    -> OWNED+TRANSFORMING  key=' + key);
-          pointCount := poly.PointCount;
-          for polyIdx := 0 to pointCount - 1 do
-          begin
-            seg := poly.Segments[polyIdx];
-            PolyLog.Add('    pre  S[' + IntToStr(polyIdx) + ']' +
-                        '  Kind=' + IntToStr(seg.Kind) +
-                        '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
-                        '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3));
-            { 2026-05-23: ARCS-AS-LINES approach. Transform the vertex
-              position; FORCE Kind=0 (line) and zero cx/cy. Arc edges
-              become straight chords between vertices. We lose curved
-              boundaries but the polygon topology is unambiguous
-              (no sweep direction to corrupt). For channel-pour
-              polygons this is acceptable -- the pour region is
-              roughly the same area, just with cut-off corners.
-
-              This bypasses the unknown-field issue: TPolySegment has
-              additional fields beyond Kind/vx/vy/cx/cy on AD26 (the
-              `angle` we hit earlier is one of them, likely arc sweep
-              direction). The seg-record copy doesn't preserve these
-              fields correctly, so writing back arcs produces invalid
-              sweep directions. Setting Kind=0 sidesteps the problem
-              entirely -- line segments have no sweep ambiguity. }
-            RotatePointXY(seg.vx, seg.vy, oldCX, oldCY, rotateDeg, tx, ty);
-            seg.vx := tx + dX;
-            seg.vy := ty + dY;
-            seg.Kind := 0;
-            seg.cx := 0;
-            seg.cy := 0;
-            poly.Segments[polyIdx] := seg;
-            { READ BACK to verify the write persisted. }
-            seg := poly.Segments[polyIdx];
-            PolyLog.Add('    post S[' + IntToStr(polyIdx) + ']' +
-                        '  Kind=' + IntToStr(seg.Kind) +
-                        '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
-                        '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3) +
-                        '  (READ-BACK)');
-          end;
-          poly.GraphicallyInvalidate;
-          PolyLog.Add('    postBBoxC=(' +
-                      FloatToStrF(CoordToMMs((poly.BoundingRectangle.Left + poly.BoundingRectangle.Right) div 2), ffFixed, 10, 3) +
-                      ',' +
-                      FloatToStrF(CoordToMMs((poly.BoundingRectangle.Bottom + poly.BoundingRectangle.Top) div 2), ffFixed, 10, 3) + ')');
-        end
-        else
-          PolyLog.Add('    -> SKIP (DoneSet hit OR not owned by ch' + IntToStr(chanIdx) + ')');
-      end
-      else
-        PolyLog.Add('    -> SKIP (Component<>Nil OR bbox-center outside ch' + IntToStr(chanIdx) + ' area)');
-    end;
-    Prim := PolyIter.NextPCBObject;
-  end;
-  Board.BoardIterator_Destroy(PolyIter);
-
-  try
-    PolyLog.SaveToFile('C:\Users\Public\polygon-move.log');
-  except
-  end;
-  PolyLog.Free;
 end;
 
 { --------------------------------------------------------------------------- }
@@ -1672,8 +1524,7 @@ begin
 
   Iter := Board.BoardIterator_Create;
   Iter.AddFilter_ObjectSet(MkSet(eTrackObject, eViaObject, eArcObject,
-                                  eFillObject, eTextObject, ePadObject,
-                                  ePolyObject));
+                                  eFillObject, eTextObject, ePadObject));
   Iter.AddFilter_LayerSet(AllLayers);
   Iter.AddFilter_Method(eProcessAll);
 
