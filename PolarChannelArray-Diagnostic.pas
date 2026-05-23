@@ -938,30 +938,34 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  D_PrimNetName -- safe getter for a primitive's net name. Wrapped in
-  try/except because Prim.Net + IPCB_Net.Name are UNVERIFIED on AD26
-  (no prior hit in either Altium-Scripts/*.pas file as of 2026-05-18).
-  Fallback chain: '(none)' if Net is Nil; '(error)' if anything raises.
+  D_PrimNetName -- stub. Originally read Prim.Net.Name under try/except, but
+  bench 2026-05-18 produced "Invalid variant operation" at runtime --
+  IPCB_Net is not grepped anywhere in the verified Altium-Scripts corpus,
+  so the .Net property + .Name accessor are UNVERIFIED on AD26. Even if
+  Prim.Net resolves at compile time, .Name on the resulting interface
+  likely returns an IPCB_String object (per the Comp.Name.Text pattern
+  used throughout PolarChannelArray.pas), not a String, so concatenation
+  raises a variant exception that try/except inside a STRING-returning
+  helper doesn't reliably catch.
+
+  Until a verified net-name accessor is found, return a sentinel. The
+  arc-orphan investigation needs comp= -- net= is secondary.
 --------------------------------------------------------------------------- }
 function D_PrimNetName(Prim : IPCB_Primitive) : String;
-var net : IPCB_Net;
 begin
-  Result := '(error)';
-  try
-    net := Prim.Net;
-    if net = Nil then Result := '(none)'
-    else Result := net.Name;
-  except
-    Result := '(error)';
-  end;
+  Result := '(skipped)';
 end;
 
 { ---------------------------------------------------------------------------
   D_PrimCompName -- safe getter for a primitive's parent-component
   designator. Returns 'Nil' for free primitives, the designator for
-  component-attached primitives, '(error)' on API failure. Prim.Component
-  IS verified in this codebase (used throughout PolarChannelArray.pas);
-  Comp.Name is the standard designator accessor (also verified).
+  component-attached primitives, '(error)' on API failure.
+
+  BUG FIX 2026-05-18 (post-bench-error): originally used `comp.Name` which
+  returns an IPCB_String-like object, not a String -- triggers "Invalid
+  variant operation" when concatenated. The verified-on-AD26 designator
+  accessor is `Comp.Name.Text` per PolarChannelArray.pas:940 / :1041 /
+  :1125 / :1633.
 --------------------------------------------------------------------------- }
 function D_PrimCompName(Prim : IPCB_Primitive) : String;
 var comp : IPCB_Component;
@@ -970,7 +974,7 @@ begin
   try
     comp := Prim.Component;
     if comp = Nil then Result := 'Nil'
-    else Result := comp.Name;
+    else Result := comp.Name.Text;
   except
     Result := '(error)';
   end;
