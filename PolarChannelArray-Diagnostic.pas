@@ -977,19 +977,21 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  D_PrimLocked -- safe getter for IPCB_Primitive.IsLocked. UNVERIFIED on
-  AD26 (the production script doesn't check IsLocked anywhere, so we have
-  zero corpus hits). If the property doesn't exist on this build, fall
-  through to '(unknown)'.
+  D_PrimLocked -- stub. Originally read Prim.IsLocked under try/except, but
+  AD26's DelphiScript compiler appears to resolve property accesses at
+  COMPILE time (not runtime as the try/except contract assumes), so an
+  unknown property raises "Undeclared identifier" at compile time that the
+  try/except can't catch -- and the failure cascades to the caller site
+  as a misleading "Undeclared identifier: Add" against the surrounding
+  Lines.Add(...) call. Bench-confirmed 2026-05-18.
+
+  Until a verified lock-state accessor is found, return a sentinel. The
+  arc-orphan investigation primarily needs comp= -- locked= is a
+  secondary hypothesis check.
 --------------------------------------------------------------------------- }
 function D_PrimLocked(Prim : IPCB_Primitive) : String;
 begin
-  Result := '(unknown)';
-  try
-    if Prim.IsLocked then Result := 'true' else Result := 'false';
-  except
-    Result := '(unknown)';
-  end;
+  Result := '(skipped)';
 end;
 
 { ---------------------------------------------------------------------------
