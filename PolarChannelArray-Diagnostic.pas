@@ -1966,8 +1966,11 @@ begin
   { ---- Section: arc-triage (added 2026-05-18 for the arc-orphan failure).
          Walks ALL arcs regardless of Component status -- the only diagnostic
          section that does so. Cap is independent of MAX_SAMPLE_PRIMS so a
-         board with thousands of arcs still gets a usable dump. ---- }
-  D_DumpArcTriage(Board, Lines, ChanNames, PreBBoxes, 2000);
+         board with thousands of arcs still gets a usable dump.
+         2026-05-23: cap bumped 2000 -> 20000 after the MotionJigBase
+         12-channel run emitted only 2000 of 11,351 arcs, missing the
+         specific orphans we're investigating. ---- }
+  D_DumpArcTriage(Board, Lines, ChanNames, PreBBoxes, 20000);
 
   { ---- Section: polar transform plan ---- }
   Lines.Add('[PLAN]');
