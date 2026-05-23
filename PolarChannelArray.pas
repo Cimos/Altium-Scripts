@@ -922,41 +922,36 @@ begin
             PolyLog.Add('    pre  S[' + IntToStr(polyIdx) + ']' +
                         '  Kind=' + IntToStr(seg.Kind) +
                         '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
-                        '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3) +
-                        '  cx=' + FloatToStrF(CoordToMMs(seg.cx), ffFixed, 10, 3) +
-                        '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3));
+                        '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3));
+            { 2026-05-23: ARCS-AS-LINES approach. Transform the vertex
+              position; FORCE Kind=0 (line) and zero cx/cy. Arc edges
+              become straight chords between vertices. We lose curved
+              boundaries but the polygon topology is unambiguous
+              (no sweep direction to corrupt). For channel-pour
+              polygons this is acceptable -- the pour region is
+              roughly the same area, just with cut-off corners.
+
+              This bypasses the unknown-field issue: TPolySegment has
+              additional fields beyond Kind/vx/vy/cx/cy on AD26 (the
+              `angle` we hit earlier is one of them, likely arc sweep
+              direction). The seg-record copy doesn't preserve these
+              fields correctly, so writing back arcs produces invalid
+              sweep directions. Setting Kind=0 sidesteps the problem
+              entirely -- line segments have no sweep ambiguity. }
             RotatePointXY(seg.vx, seg.vy, oldCX, oldCY, rotateDeg, tx, ty);
             seg.vx := tx + dX;
             seg.vy := ty + dY;
-            if seg.Kind = 1 then  { arc segment -- transform the arc center too }
-            begin
-              RotatePointXY(seg.cx, seg.cy, oldCX, oldCY, rotateDeg, tx, ty);
-              seg.cx := tx + dX;
-              seg.cy := ty + dY;
-            end;
+            seg.Kind := 0;
+            seg.cx := 0;
+            seg.cy := 0;
             poly.Segments[polyIdx] := seg;
             { READ BACK to verify the write persisted. }
             seg := poly.Segments[polyIdx];
             PolyLog.Add('    post S[' + IntToStr(polyIdx) + ']' +
+                        '  Kind=' + IntToStr(seg.Kind) +
                         '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
                         '  vy=' + FloatToStrF(CoordToMMs(seg.vy), ffFixed, 10, 3) +
-                        '  cx=' + FloatToStrF(CoordToMMs(seg.cx), ffFixed, 10, 3) +
-                        '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3) +
                         '  (READ-BACK)');
-          end;
-          { 2026-05-23: try poly.Rebuild after writing all segments. If
-            TPolySegment has a sweep-angle field we're not preserving,
-            Rebuild may recompute it from start/end/center positions.
-            UNVERIFIED on AD26; wrapped in try/except so a runtime
-            failure logs but doesn't break the script. (Compile failure
-            would surface as "Undeclared identifier: Rebuild" and we'd
-            try alternative names: UpdateOutline / RecalcContour /
-            Refresh / Update.) }
-          try
-            poly.Rebuild;
-            PolyLog.Add('    Rebuild: OK');
-          except
-            PolyLog.Add('    Rebuild: raised at runtime');
           end;
           poly.GraphicallyInvalidate;
           PolyLog.Add('    postBBoxC=(' +
