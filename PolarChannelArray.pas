@@ -352,8 +352,25 @@ begin
       Result := 'V:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X) + ',' + IntToStr(Prim.Y);
     eArcObject:
+      { 2026-05-23: Radius + StartAngle + EndAngle added to key. Previously
+        the key was Layer + XCenter + YCenter only -- concentric arcs (a
+        common shape in fanout / impedance-controlled / differential
+        routing, where many tracks share a turn centerpoint) hashed to the
+        same key. The apply phase's DoneSet then accepted the first arc
+        encountered and SILENTLY SKIPPED the rest, leaving 30%+ of free
+        arcs as orphans. Worked example on MotionJigBase 2026-05-23:
+        1,944 collision groups, 4,417 predicted orphans, observed on
+        Simon's bench. Adding radius + angles makes every distinct arc
+        unique. FloatToStrF on a stable Double is deterministic within
+        one apply iteration -- the key is recomputed from the arc's
+        in-memory state at each lookup, so as long as the arc has not
+        been mutated between OwnerMap build and DoneSet lookup (it has
+        not), the strings match. }
       Result := 'A:' + IntToStr(Prim.Layer) + ',' +
-                IntToStr(Prim.XCenter) + ',' + IntToStr(Prim.YCenter);
+                IntToStr(Prim.XCenter) + ',' + IntToStr(Prim.YCenter) + ',' +
+                IntToStr(Prim.Radius) + ',' +
+                FloatToStrF(Prim.StartAngle, ffFixed, 10, 4) + ',' +
+                FloatToStrF(Prim.EndAngle,   ffFixed, 10, 4);
     eFillObject:
       Result := 'F:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X1Location) + ',' + IntToStr(Prim.Y1Location) + ',' +

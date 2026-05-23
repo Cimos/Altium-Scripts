@@ -130,8 +130,13 @@ begin
       Result := 'V:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X) + ',' + IntToStr(Prim.Y);
     eArcObject:
+      { Mirrors PolarChannelArray.pas:354 — see that file for why Radius +
+        StartAngle + EndAngle are required for arc-key uniqueness. }
       Result := 'A:' + IntToStr(Prim.Layer) + ',' +
-                IntToStr(Prim.XCenter) + ',' + IntToStr(Prim.YCenter);
+                IntToStr(Prim.XCenter) + ',' + IntToStr(Prim.YCenter) + ',' +
+                IntToStr(Prim.Radius) + ',' +
+                FloatToStrF(Prim.StartAngle, ffFixed, 10, 4) + ',' +
+                FloatToStrF(Prim.EndAngle,   ffFixed, 10, 4);
     eFillObject:
       Result := 'F:' + IntToStr(Prim.Layer) + ',' +
                 IntToStr(Prim.X1Location) + ',' + IntToStr(Prim.Y1Location) + ',' +
