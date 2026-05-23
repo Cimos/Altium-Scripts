@@ -102,13 +102,17 @@ begin
             readOK := False;
           end;
           if readOK then
+            { seg.angle was undeclared on AD26 (bench-confirmed 2026-05-23).
+              Dropped here; for the polygon-mover we only need vx/vy for
+              line segments. If arc-outline segments need sweep info, a
+              follow-up probe can test alternate field names
+              (Angle1/Angle2, SegAngle, theAngle). }
             Lines.Add('  S[' + IntToStr(i) + ']' +
                       '  Kind=' + IntToStr(seg.Kind) +
                       '  vx=' + P3b_Fmt(seg.vx) + 'mm' +
                       '  vy=' + P3b_Fmt(seg.vy) + 'mm' +
                       '  cx=' + P3b_Fmt(seg.cx) + 'mm' +
-                      '  cy=' + P3b_Fmt(seg.cy) + 'mm' +
-                      '  angle=' + FloatToStrF(seg.angle, ffFixed, 10, 4))
+                      '  cy=' + P3b_Fmt(seg.cy) + 'mm')
           else
             Lines.Add('  S[' + IntToStr(i) + '] = (read failed)');
         end;
