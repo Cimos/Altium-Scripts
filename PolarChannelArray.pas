@@ -935,9 +935,7 @@ begin
               seg.cy := ty + dY;
             end;
             poly.Segments[polyIdx] := seg;
-            { READ BACK to verify the write persisted. If readback shows
-              different values from what we wrote, Segments[i] := seg is
-              a silent no-op (the compile-test only verified syntax). }
+            { READ BACK to verify the write persisted. }
             seg := poly.Segments[polyIdx];
             PolyLog.Add('    post S[' + IntToStr(polyIdx) + ']' +
                         '  vx=' + FloatToStrF(CoordToMMs(seg.vx), ffFixed, 10, 3) +
@@ -945,6 +943,20 @@ begin
                         '  cx=' + FloatToStrF(CoordToMMs(seg.cx), ffFixed, 10, 3) +
                         '  cy=' + FloatToStrF(CoordToMMs(seg.cy), ffFixed, 10, 3) +
                         '  (READ-BACK)');
+          end;
+          { 2026-05-23: try poly.Rebuild after writing all segments. If
+            TPolySegment has a sweep-angle field we're not preserving,
+            Rebuild may recompute it from start/end/center positions.
+            UNVERIFIED on AD26; wrapped in try/except so a runtime
+            failure logs but doesn't break the script. (Compile failure
+            would surface as "Undeclared identifier: Rebuild" and we'd
+            try alternative names: UpdateOutline / RecalcContour /
+            Refresh / Update.) }
+          try
+            poly.Rebuild;
+            PolyLog.Add('    Rebuild: OK');
+          except
+            PolyLog.Add('    Rebuild: raised at runtime');
           end;
           poly.GraphicallyInvalidate;
           PolyLog.Add('    postBBoxC=(' +
