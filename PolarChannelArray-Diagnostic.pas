@@ -914,16 +914,11 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  D_Fmt + D_FmtDeg were here originally but were relocated to ~line 91
-  (immediately after D_RotatePointXY) on 2026-05-18 to fix a forward-
-  reference compile error. DelphiScript on AD26 needs the definition
-  before any use, and the first uses appear in routines defined ~50 lines
-  above this point.
---------------------------------------------------------------------------- }
-
-{ ---------------------------------------------------------------------------
   D_LayerName -- return a human-readable layer name for diagnostic output.
   Falls back to the integer string if the board API call raises.
+  Relocated 2026-05-18 from ~line 1084 to above D_DumpArcTriage so the
+  arc-triage procedure can resolve it. DelphiScript on AD26 has no two-
+  pass scan -- definitions must precede first use.
 --------------------------------------------------------------------------- }
 function D_LayerName(Board : IPCB_Board; layer : Integer) : String;
 begin
@@ -933,6 +928,241 @@ begin
   except
   end;
 end;
+
+{ ---------------------------------------------------------------------------
+  D_BoolStr -- canonical "true"/"false" rendering.
+--------------------------------------------------------------------------- }
+function D_BoolStr(b : Boolean) : String;
+begin
+  if b then Result := 'true' else Result := 'false';
+end;
+
+{ ---------------------------------------------------------------------------
+  D_PrimNetName -- safe getter for a primitive's net name. Wrapped in
+  try/except because Prim.Net + IPCB_Net.Name are UNVERIFIED on AD26
+  (no prior hit in either Altium-Scripts/*.pas file as of 2026-05-18).
+  Fallback chain: '(none)' if Net is Nil; '(error)' if anything raises.
+--------------------------------------------------------------------------- }
+function D_PrimNetName(Prim : IPCB_Primitive) : String;
+var net : IPCB_Net;
+begin
+  Result := '(error)';
+  try
+    net := Prim.Net;
+    if net = Nil then Result := '(none)'
+    else Result := net.Name;
+  except
+    Result := '(error)';
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  D_PrimCompName -- safe getter for a primitive's parent-component
+  designator. Returns 'Nil' for free primitives, the designator for
+  component-attached primitives, '(error)' on API failure. Prim.Component
+  IS verified in this codebase (used throughout PolarChannelArray.pas);
+  Comp.Name is the standard designator accessor (also verified).
+--------------------------------------------------------------------------- }
+function D_PrimCompName(Prim : IPCB_Primitive) : String;
+var comp : IPCB_Component;
+begin
+  Result := '(error)';
+  try
+    comp := Prim.Component;
+    if comp = Nil then Result := 'Nil'
+    else Result := comp.Name;
+  except
+    Result := '(error)';
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  D_PrimLocked -- safe getter for IPCB_Primitive.IsLocked. UNVERIFIED on
+  AD26 (the production script doesn't check IsLocked anywhere, so we have
+  zero corpus hits). If the property doesn't exist on this build, fall
+  through to '(unknown)'.
+--------------------------------------------------------------------------- }
+function D_PrimLocked(Prim : IPCB_Primitive) : String;
+begin
+  Result := '(unknown)';
+  try
+    if Prim.IsLocked then Result := 'true' else Result := 'false';
+  except
+    Result := '(unknown)';
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  D_DumpArcTriage -- added 2026-05-18 to investigate the arc-orphan failure.
+
+  D_DumpOwnershipStage filters Prim.Component=Nil at its outer test (line
+  ~808), which mirrors what the production BuildPrimitiveOwnership does --
+  but that means component-attached arcs (e.g. teardrops) NEVER appear in
+  its output. So when 3 small arcs at chan-1's pre-array source position
+  failed to move 2026-05-18, the existing diagnostic gave us no insight
+  into whether they were Component-attached.
+
+  This procedure does the same ownership analysis but walks ARCS ONLY,
+  EMITS THEM REGARDLESS OF Component STATUS, and reports comp= so we can
+  see directly whether the orphans are teardrops or free arcs.
+
+  Output cap: MaxArcs (caller-supplied). At ~14k free primitives across 12
+  channels in the MotionJigBase test board, arc count is likely <2000.
+--------------------------------------------------------------------------- }
+procedure D_DumpArcTriage(Board     : IPCB_Board;
+                          Lines     : TStringList;
+                          ChanNames : TStringList;
+                          PreBBoxes : TStringList;
+                          MaxArcs   : Integer);
+var
+  Iter : IPCB_BoardIterator;
+  Prim : IPCB_Primitive;
+  arc  : IPCB_Arc;
+  primX, primY : TCoord;
+  i, bestI : Integer;
+  N : Integer;
+  preMinX, preMinY, preMaxX, preMaxY, preCX, preCY : TCoord;
+  preCount : Integer;
+  dxm, dym, distSq, bestDistSq : Double;
+  bestMinX, bestMinY, bestMaxX, bestMaxY : TCoord;
+  margin : TCoord;
+  key : String;
+  emitted, totalArcs, freeArcs, compAttachedArcs : Integer;
+  validated : Boolean;
+  decisionStr : String;
+begin
+  N := ChanNames.Count;
+  totalArcs := 0;
+  freeArcs := 0;
+  compAttachedArcs := 0;
+  emitted := 0;
+
+  Lines.Add('[ARC_TRIAGE]');
+  Lines.Add('  Walks every arc primitive on the board, regardless of');
+  Lines.Add('  Component status. Reports comp= and locked= so the');
+  Lines.Add('  arc-orphan failure root cause (teardrop / locked / nearest-');
+  Lines.Add('  channel mis-attribution) can be read off the dump.');
+  Lines.Add('');
+
+  Iter := Board.BoardIterator_Create;
+  Iter.AddFilter_ObjectSet(MkSet(eArcObject));
+  Iter.AddFilter_LayerSet(AllLayers);
+  Iter.AddFilter_Method(eProcessAll);
+
+  Prim := Iter.FirstPCBObject;
+  while Prim <> Nil do
+  begin
+    if Prim.ObjectId = eArcObject then
+    begin
+      arc := Prim;
+      totalArcs := totalArcs + 1;
+      if arc.Component = Nil then freeArcs := freeArcs + 1
+      else compAttachedArcs := compAttachedArcs + 1;
+
+      primX := arc.XCenter;
+      primY := arc.YCenter;
+
+      { Nearest pre-bbox channel + bbox+margin validation -- same logic as
+        D_DumpOwnershipStage so the per-arc decision is comparable. }
+      bestI := -1;
+      bestDistSq := 0;
+      bestMinX := 0; bestMinY := 0; bestMaxX := 0; bestMaxY := 0;
+      for i := 0 to N - 1 do
+      begin
+        D_GetBBoxFromSnapshot(PreBBoxes, i,
+                              preMinX, preMinY, preMaxX, preMaxY,
+                              preCX, preCY, preCount);
+        if preCount > 0 then
+        begin
+          dxm := CoordToMMs(primX - preCX);
+          dym := CoordToMMs(primY - preCY);
+          distSq := (dxm * dxm) + (dym * dym);
+          if (bestI < 0) or (distSq < bestDistSq) then
+          begin
+            bestDistSq := distSq;
+            bestI := i;
+            bestMinX := preMinX; bestMinY := preMinY;
+            bestMaxX := preMaxX; bestMaxY := preMaxY;
+          end;
+        end;
+      end;
+
+      validated := False;
+      if bestI >= 0 then
+      begin
+        margin := D_ComputeMargin(bestMinX, bestMinY, bestMaxX, bestMaxY);
+        validated := D_PointInRect(primX, primY,
+                                   bestMinX - margin, bestMinY - margin,
+                                   bestMaxX + margin, bestMaxY + margin);
+      end;
+
+      if validated and (bestI >= 0) then
+        decisionStr := 'OWNED_BY=ch' + IntToStr(bestI) + '(' + ChanNames[bestI] + ')'
+      else if bestI >= 0 then
+        decisionStr := 'NEAREST=ch' + IntToStr(bestI) + '(' + ChanNames[bestI] +
+                       ')_BUT_OUTSIDE_BBOX'
+      else
+        decisionStr := 'NO_CHANNEL_HAS_COMPS';
+
+      if emitted < MaxArcs then
+      begin
+        key := D_PrimitiveKey(arc);
+        Lines.Add('  ARC[' + IntToStr(totalArcs) + ']  ' +
+                  'layer=' + D_LayerName(Board, arc.Layer) +
+                  '  Xc=' + D_Fmt(primX) + 'mm' +
+                  '  Yc=' + D_Fmt(primY) + 'mm' +
+                  '  r=' + D_Fmt(arc.Radius) + 'mm' +
+                  '  a0=' + D_FmtDeg(arc.StartAngle) +
+                  '  a1=' + D_FmtDeg(arc.EndAngle) +
+                  '  net=' + D_PrimNetName(arc) +
+                  '  comp=' + D_PrimCompName(arc) +
+                  '  locked=' + D_PrimLocked(arc) +
+                  '  key=' + key +
+                  '  decision=' + decisionStr);
+        emitted := emitted + 1;
+      end;
+    end;
+    Prim := Iter.NextPCBObject;
+  end;
+  Board.BoardIterator_Destroy(Iter);
+
+  Lines.Add('');
+  Lines.Add('  -- Arc triage summary --');
+  Lines.Add('  total arcs on board   : ' + IntToStr(totalArcs));
+  Lines.Add('  free arcs (comp=Nil)  : ' + IntToStr(freeArcs));
+  Lines.Add('  component-attached    : ' + IntToStr(compAttachedArcs));
+  Lines.Add('  emitted (capped @' + IntToStr(MaxArcs) + ') : ' + IntToStr(emitted));
+  Lines.Add('');
+  Lines.Add('  Interpretation for the 2026-05-18 orphan-arc failure:');
+  Lines.Add('    - Search this section for the orphan coordinates');
+  Lines.Add('      (~458-462, 286 on the MotionJigBase test board).');
+  Lines.Add('    - If their comp= is NOT "Nil" -> teardrop hypothesis');
+  Lines.Add('      confirmed; production script filter at');
+  Lines.Add('      PolarChannelArray.pas:711 and :1517 needs to handle');
+  Lines.Add('      component-attached arcs (move with parent component).');
+  Lines.Add('    - If comp=Nil and locked=true -> locked-write hypothesis;');
+  Lines.Add('      fix is to clear IsLocked, mutate, restore.');
+  Lines.Add('    - If comp=Nil and locked=false -> both hypotheses refuted;');
+  Lines.Add('      look at SpatialIterator bbox semantics OR re-check the');
+  Lines.Add('      apply-phase code path.');
+  Lines.Add('');
+end;
+
+{ ---------------------------------------------------------------------------
+  D_Fmt + D_FmtDeg were here originally but were relocated to ~line 91
+  (immediately after D_RotatePointXY) on 2026-05-18 to fix a forward-
+  reference compile error. DelphiScript on AD26 needs the definition
+  before any use, and the first uses appear in routines defined ~50 lines
+  above this point.
+--------------------------------------------------------------------------- }
+
+{ ---------------------------------------------------------------------------
+  D_LayerName + D_BoolStr / D_PrimNetName / D_PrimCompName / D_PrimLocked
+  were defined here originally. Relocated 2026-05-18 to ~line 915
+  (immediately above D_DumpArcTriage) so the arc-triage procedure can
+  resolve them. DelphiScript on AD26 has no two-pass scan -- caller and
+  callee must be in declaration order.
+--------------------------------------------------------------------------- }
 
 { ---------------------------------------------------------------------------
   D_ClassCount -- count user-defined (non-built-in) component classes on
@@ -1085,19 +1315,30 @@ begin
       eArcObject:
       begin
         arc := Prim;
-        if arc.Component = Nil then
+        { 2026-05-18: Component=Nil filter dropped for arcs (kept for other
+          primitive kinds in this routine). Reason: investigating orphan-arc
+          failure where ~3 small arcs at (458-462, 286) didn't move with
+          chan-1. Hypothesis is that these arcs have Component <> Nil
+          (teardrops attached to a parent pad), which the production script
+          filters at PolarChannelArray.pas:711 and :1517. Emit with comp=
+          and locked= so we can see directly. PointInRect kept -- this is
+          the per-channel-bbox listing. }
+        if D_PointInRect(arc.XCenter, arc.YCenter,
+                         bx1 - margin, by1 - margin,
+                         bx2 + margin, by2 + margin) then
         begin
-          if D_PointInRect(arc.XCenter, arc.YCenter,
-                           bx1 - margin, by1 - margin,
-                           bx2 + margin, by2 + margin) then
-          begin
-            layerStr := D_LayerName(Board, arc.Layer);
-            Lines.Add(indent + 'PRIM  kind=ARC' +
-                      '  layer=' + layerStr +
-                      '  Xctr=' + D_Fmt(arc.XCenter) + 'mm' +
-                      '  Yctr=' + D_Fmt(arc.YCenter) + 'mm');
-            emitted := emitted + 1;
-          end;
+          layerStr := D_LayerName(Board, arc.Layer);
+          Lines.Add(indent + 'PRIM  kind=ARC' +
+                    '  layer=' + layerStr +
+                    '  Xctr=' + D_Fmt(arc.XCenter) + 'mm' +
+                    '  Yctr=' + D_Fmt(arc.YCenter) + 'mm' +
+                    '  r=' + D_Fmt(arc.Radius) + 'mm' +
+                    '  a0=' + D_FmtDeg(arc.StartAngle) +
+                    '  a1=' + D_FmtDeg(arc.EndAngle) +
+                    '  net=' + D_PrimNetName(arc) +
+                    '  comp=' + D_PrimCompName(arc) +
+                    '  locked=' + D_PrimLocked(arc));
+          emitted := emitted + 1;
         end;
       end;
 
@@ -1425,7 +1666,13 @@ var
   predRot : Double;
 begin
   MAX_SAMPLE_COMPS  := 3;
-  MAX_SAMPLE_PRIMS  := 5;
+  MAX_SAMPLE_PRIMS  := 200;  { bumped 2026-05-18 from 5 -> 200 so per-channel
+                               PRIM list + ownership-stage sample show enough
+                               primitives to investigate the arc-orphan failure.
+                               At 5 the dump emitted zero kind=ARC entries
+                               across all 12 channels (sampling artefact, not
+                               evidence). 200 keeps output under ~2400 PRIM
+                               lines (12 channels x 200). }
   MAX_SAMPLE_TRACKS := 3;
 
   Board := PCBServer.GetCurrentPCBBoard;
@@ -1709,6 +1956,12 @@ begin
 
   { ---- Section: ownership stage (dry-run of v16 BuildPrimitiveOwnership) ---- }
   D_DumpOwnershipStage(Board, Lines, ChanNames, PreBBoxes, MAX_SAMPLE_PRIMS);
+
+  { ---- Section: arc-triage (added 2026-05-18 for the arc-orphan failure).
+         Walks ALL arcs regardless of Component status -- the only diagnostic
+         section that does so. Cap is independent of MAX_SAMPLE_PRIMS so a
+         board with thousands of arcs still gets a usable dump. ---- }
+  D_DumpArcTriage(Board, Lines, ChanNames, PreBBoxes, 2000);
 
   { ---- Section: polar transform plan ---- }
   Lines.Add('[PLAN]');
